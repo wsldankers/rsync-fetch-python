@@ -9,5 +9,5 @@ with open('debian/changelog') as changelog:
 setup(
 	name = name,
 	version = version,
-	ext_modules = [Extension('rsync_fetch', ['rsync_fetch.c'])],
+	ext_modules = [Extension('rsync_fetch', ['rsync-fetch.c'])],
 )
