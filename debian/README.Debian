@@ -1,0 +1,6 @@
+rsync-fetch-python
+--------------
+
+Python 3 module to fetch files using rsync.
+
+ -- Wessel Dankers <wsl@fruit.je>  Sat, 27 Oct 2018 14:40:19 +0200

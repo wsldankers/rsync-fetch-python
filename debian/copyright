@@ -1,0 +1,14 @@
+This package was created by Wessel Dankers <wsl@fruit.je> on
+Sat, 27 Oct 2018 14:40:19 +0200.
+
+It can be downloaded from http://www.fruit.je/download/fruitbak/
+Version control is at https://git.fruit.je/rsync-fetch-python
+
+Upstream Author: Wessel Dankers <wsl@fruit.je>
+
+Copyright: 2018 Wessel Dankers <wsl@fruit.je>
+
+License: GPL version 3 or any later version.
+
+The Debian packaging is Copyright © 2017: Wessel Dankers <wsl@fruit.je>
+and is licensed under the GPL, see '/usr/share/common-licenses/GPL-3'.
