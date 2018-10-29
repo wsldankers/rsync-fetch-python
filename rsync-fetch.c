@@ -66,81 +66,6 @@ static inline RsyncFetch_t *RsyncFetch_Check(PyObject *v) {
 		: NULL;
 }
 
-static bool stream_read(RsyncFetch_t *tf, pipestream_t *stream) {
-	bucket_t *tail = stream->buf_tail;
-	size_t avail;
-	size_t end_offset = stream->end_offset;
-	bucket_t *prev;
-	if(tail) {
-		prev = tail->prev;
-		avail = sizeof tail->buf - end_offset;
-		if(!avail) {
-			prev = tail;
-			tail = malloc(sizeof tail);
-			tail->prev = prev;
-			tail->next = NULL;
-			prev->next = tail;
-			stream->buf_tail = tail;
-			stream->end_offset = 0;
-			end_offset = 0;
-			avail = sizeof tail->buf;
-		}
-	} else {
-		prev = NULL;
-		tail = malloc(sizeof tail);
-		if(!tail)
-			return false;
-		tail->prev = NULL;
-		tail->next = NULL;
-		stream->buf_head = tail;
-		stream->buf_tail = tail;
-		avail = sizeof tail->buf;
-	}
-	
-	ssize_t r = read(stream->fd, tail->buf + end_offset, avail);
-	if(r == -1)
-		return false;
-
-	stream->end_offset = end_offset + r;
-	stream->length += r;
-
-	return true;
-}
-
-static bool stream_write(RsyncFetch_t *tf, pipestream_t *stream) {
-	bucket_t *head = stream->buf_head;
-	assert(head);
-	bucket_t *next = head->next;
-	size_t start_offset = stream->start_offset;
-	size_t head_usage = (next ? sizeof head->buf : stream->end_offset) - start_offset;
-	size_t r = write(stream->fd, head->buf + start_offset, head_usage);
-	if(r == -1)
-		return false;
-	stream->length -= r;
-	if(r == head_usage) {
-		stream->start_offset = 0;
-		if(next) {
-			free(head);
-			stream->buf_head = next;
-			next->prev = NULL;
-		} else {
-			stream->end_offset = 0;
-		}
-	} else {
-		start_offset += r;
-		stream->start_offset = start_offset;
-		if(!next) {
-			head_usage -= r;
-			if(head_usage <= 256) {
-				memmove(head->buf, head->buf + start_offset, head_usage);
-				stream->start_offset = 0;
-				stream->end_offset = head_usage;
-			}
-		}
-	}
-	return true;
-}
-
 #ifndef HAVE_PIPE2
 static int pipe2(int *fds, int flags) {
 	if(pipe(fds) == -1)
@@ -258,6 +183,85 @@ static int RsyncFetch_dealloc(PyObject *self) {
 	return 0;
 }
 
+static bool stream_read(RsyncFetch_t *rf, pipestream_t *stream) {
+	bucket_t *tail = stream->buf_tail;
+	size_t avail;
+	size_t end_offset = stream->end_offset;
+	bucket_t *prev;
+	if(tail) {
+		prev = tail->prev;
+		if(!prev) {
+			size_t start_offset = stream->start_offset;
+			size_t used = end_offset - start_offset;
+			if(used <= 256) {
+				memmove(tail->buf, tail->buf + start_offset, used);
+				stream->start_offset = 0;
+				stream->end_offset = used;
+				end_offset = used;
+			}
+		}
+
+		avail = sizeof tail->buf - end_offset;
+		if(!avail) {
+			prev = tail;
+			tail = malloc(sizeof tail);
+			if(!tail)
+				return false;
+			tail->prev = prev;
+			tail->next = NULL;
+			prev->next = tail;
+			stream->buf_tail = tail;
+			stream->end_offset = 0;
+			end_offset = 0;
+			avail = sizeof tail->buf;
+		}
+	} else {
+		prev = NULL;
+		tail = malloc(sizeof tail);
+		if(!tail)
+			return false;
+		tail->prev = NULL;
+		tail->next = NULL;
+		stream->buf_head = tail;
+		stream->buf_tail = tail;
+		avail = sizeof tail->buf;
+	}
+
+	ssize_t r = read(stream->fd, tail->buf + end_offset, avail);
+	if(r == -1)
+		return false;
+
+	stream->end_offset = end_offset + r;
+	stream->length += r;
+
+	return true;
+}
+
+static bool stream_write(RsyncFetch_t *rf, pipestream_t *stream) {
+	bucket_t *head = stream->buf_head;
+	assert(head);
+	bucket_t *next = head->next;
+	size_t start_offset = stream->start_offset;
+	size_t head_usage = (next ? sizeof head->buf : stream->end_offset) - start_offset;
+	size_t r = write(stream->fd, head->buf + start_offset, head_usage);
+	if(r == -1)
+		return false;
+	stream->length -= r;
+	if(r == head_usage) {
+		stream->start_offset = 0;
+		if(next) {
+			free(head);
+			stream->buf_head = next;
+			next->prev = NULL;
+		} else {
+			stream->end_offset = 0;
+		}
+	} else {
+		stream->start_offset = start_offset + r;
+	}
+	return true;
+}
+
 static bool do_io(RsyncFetch_t *rf) {
 	struct pollfd pfds[3];
 	for(int i = 0; i < STREAM_NUM; i++) {
@@ -302,6 +306,102 @@ static bool do_io(RsyncFetch_t *rf) {
 	return true;
 }
 
+static bool stream_enqueue(RsyncFetch_t *rf, pipestream_t *stream, const char *buf, size_t len) {
+	bucket_t *tail = stream->buf_tail;
+	if(tail) {
+		size_t end_offset = stream->end_offset;
+		if(!tail->prev) {
+			size_t start_offset = stream->start_offset;
+			size_t used = end_offset - start_offset;
+			if(used <= 256) {
+				memmove(tail->buf, tail->buf + start_offset, used);
+				stream->start_offset = 0;
+				stream->end_offset = used;
+				end_offset = used;
+			}
+		}
+		size_t avail = sizeof tail->buf - end_offset;
+		if(avail) {
+			if(len > avail) {
+				memcpy(tail->buf + end_offset, buf, avail);
+				len -= avail;
+				buf += avail;
+				stream->end_offset = sizeof tail->buf;
+				stream->length += avail;
+			} else {
+				memcpy(tail->buf + end_offset, buf, len);
+				stream->end_offset = end_offset + len;
+				stream->length += len;
+				return true;
+			}
+		}
+	}
+
+	for(;;) {
+		bucket_t *prev = tail;
+		tail = malloc(sizeof *tail);
+		if(!tail)
+			return false;
+		tail->prev = prev;
+		tail->next = NULL;
+		if(prev)
+			prev->next = tail;
+		else
+			stream->buf_head = tail;
+		stream->buf_tail = tail;
+
+		if(len > sizeof tail->buf) {
+			memcpy(tail->buf, buf, sizeof tail->buf);
+			buf += sizeof tail->buf;
+			len -= sizeof tail->buf;
+			stream->end_offset = sizeof tail->buf;
+			stream->length += sizeof tail->buf;
+		} else {
+			memcpy(tail->buf, buf, len);
+			stream->end_offset = len;
+			stream->length += len;
+			return true;
+		}
+	}
+}
+
+static bool stream_dequeue(RsyncFetch_t *rf, pipestream_t *stream, const char *buf, size_t len) {
+	if(!len)
+		return true;
+	while(stream->length < len)
+		if(!do_io(rf))
+			return false;
+	for(;;) {
+		bucket_t *head = stream->buf_head;
+		bucket_t *next = head->next;
+		size_t start_offset = stream->start_offset;
+		size_t avail = (next ? sizeof head->buf : stream->end_offset) - start_offset;
+		if(avail > len) {
+			memcpy(buf, head->buf + start_offset, len);
+			stream->start_offset = start_offset + len;
+			stream->length -= len;
+			return true;
+		} else {
+			memcpy(buf, head->buf + start_offset, avail);
+			stream->length -= avail;
+			stream->start_offset = 0;
+			if(next) {
+				free(head);
+				head = next;
+				len -= avail;
+				buf += avail;
+				start_offset = 0;
+				next->prev = NULL;
+				stream->buf_head = next;
+			} else {
+				assert(len == avail);
+				stream->end_offset = 0;
+				return true;
+			}
+		}
+	}
+}
+
 static PyObject *RsyncFetch_readbytes(PyObject *self, PyObject *howmany_obj) {
 	PyErr_Clear();
 	Py_ssize_t howmany = PyNumber_AsSsize_t(howmany_obj, PyExc_OverflowError);
@@ -317,7 +417,7 @@ static PyObject *RsyncFetch_readbytes(PyObject *self, PyObject *howmany_obj) {
 	while(rf->stream[STREAM_IN].length < howmany)
 		if(!do_io(rf))
 			return PyErr_SetFromErrno(PyExc_OSError);
-		
+
 	return PyErr_Format(PyExc_NotImplementedError, "not implemented yet - teehee");
 }
 
