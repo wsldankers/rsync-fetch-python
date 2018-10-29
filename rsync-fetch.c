@@ -365,7 +365,7 @@ static bool stream_enqueue(RsyncFetch_t *rf, pipestream_t *stream, const char *b
 	}
 }
 
-static bool stream_dequeue(RsyncFetch_t *rf, pipestream_t *stream, const char *buf, size_t len) {
+static bool stream_dequeue(RsyncFetch_t *rf, pipestream_t *stream, char *buf, size_t len) {
 	if(!len)
 		return true;
 	while(stream->length < len)
