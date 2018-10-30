@@ -76,12 +76,8 @@ typedef struct RsyncFetch {
 	PyObject_HEAD
 	uint64_t magic;
 	pipestream_t stream[3];
-	// for incoming messages:
-	pipestream_t message;
-	size_t message_length;
+	size_t multiplex_length;
 	int pid;
-	enum message_id message_id;
-	bool message_active;
 	bool multiplex;
 } RsyncFetch_t;
 
@@ -163,11 +159,7 @@ static PyObject *RsyncFetch_new(PyTypeObject *subtype, PyObject *args, PyObject 
 									rf->stream[STREAM_IN].fd = in_pipe[0];
 									rf->stream[STREAM_OUT].fd = out_pipe[1];
 									rf->stream[STREAM_ERR].fd = err_pipe[0];
-
-									rf->message = pipestream_0;
-									rf->message_id = MSG_DATA;
-									rf->message_length = 0;
-									rf->message_active = false;
+									rf->multiplex_length = 0;
 
 									return &rf->ob_base;
 								}
@@ -234,13 +226,6 @@ static int RsyncFetch_dealloc(PyObject *self) {
 				free(head);
 				head = next;
 			}
-		}
-		pipestream_t *stream = &rf->message;
-		bucket_t *head = stream->buf_head; 
-		while(head) {
-			bucket_t *next = head->next;
-			free(head);
-			head = next;
 		}
 		if(rf->pid)
 			while(waitpid(rf->pid, NULL, 0) == -1 && errno == EINTR);
@@ -331,41 +316,6 @@ static bool stream_write(RsyncFetch_t *rf, pipestream_t *stream) {
 	return true;
 }
 
-static bool stream_copy(RsyncFetch_t *rf, pipestream_t *dst, pipestream_t *src, size_t len) {
-	if(len > src->length)
-		len = src->length;
-	if(!len)
-		return true;
-	size_t start_offset = src->start_offset;
-	for(;;) {
-		bucket_t *head = src->head;
-		bucket_t *next = head->next;
-		size_t used = (next ? sizeof head->buf : end_offset) - start_offset;
-		if(len < used) {
-			if(!stream_enqueue(rf, dst, head->buf + start_offset, len))
-				return false;
-			src->start_offset = start_offset + len;
-			src->length -= len;
-			len -= used;
-			return true;
-		} else {
-			if(!stream_enqueue(rf, dst, head->buf + start_offset, used))
-				return false;
-			if(next) {
-				free(head);
-				src->length -= used;
-				src->buf_head = next;
-				next->prev = NULL;
-				head = next;
-			} else {
-				src->length = 0;
-				src->start_offset = 0;
-				src->end_offset = 0;
-			}
-		}
-	}
-}
-
 static bool do_io(RsyncFetch_t *rf) {
 	struct pollfd pfds[3];
 	for(int i = 0; i < STREAM_NUM; i++) {
@@ -408,18 +358,6 @@ static bool do_io(RsyncFetch_t *rf) {
 	for(int i = 0; i < orz(pfds); i++) {
 		if(pfds[i].revents & POLLIN)
 			return stream_read(rf, &rf->stream[i]);
-	}
-
-	pipestream_t *stream = &rf->stream[STREAM_IN];
-	while(stream->length) {
-		if(rf->message_active) {
-			if(!stream_copy(&rf->message, stream, rf->message_length))
-				return false;
-			if(rf->message_length > stream->length)
-				rf->message_length -= stream->length;
-			else
-				rf->message_length = 0;
-		}
 	}
 
 	return true;
@@ -516,6 +454,61 @@ static bool stream_dequeue(RsyncFetch_t *rf, pipestream_t *stream, char *buf, si
 				assert(len == avail);
 				stream->end_offset = 0;
 				return true;
+			}
+		}
+	}
+}
+
+static bool stream_multiplex(RsyncFetch_t *rf, pipestream_t *stream, char *buf, size_t len) {
+	while(len) {
+		size_t chunk = len < 0xFFFFFF ? len : 0xFFFFFF;
+		uint8_t mplex[4] = { chunk, chunk >> 8, chunk >> 16, MSG_DATA };
+		if(!stream_enqueue(rf, stream, (char *)mplex, sizeof mplex))
+			return false;
+		if(!stream_enqueue(rf, stream, buf, chunk))
+			return false;
+		len -= chunk;
+		buf += chunk;
+	}
+}
+
+static bool stream_demultiplex(RsyncFetch_t *rf, pipestream_t *stream, char *buf, size_t len) {
+	size_t multiplex_length = rf->multiplex_length;
+	for(;;) {
+		if(multiplex_length < len) {
+			if(multiplex_length) {
+				if(!stream_dequeue(rf, stream, buf, multiplex_length))
+					return false;
+				buf += multiplex_length;
+				len -= multiplex_length;
+			}
+		} else {
+			rf->multiplex_length = multiplex_length - len;
+			return stream_dequeue(rf, stream, buf, len);
+		}
+
+		for(;;) {
+			uint8_t mplex[4];
+			if(!stream_dequeue(rf, stream, (char *)mplex, sizeof mplex))
+				return false;
+			uint8_t channel = mplex[3];
+			size_t multiplex_length = mplex[0] | mplex[1] << 8 | mplex[2] << 16;
+
+			if(channel == MSG_DATA)
+				break;
+
+			if(multiplex_length) {
+				char *message = malloc(multiplex_length);
+				if(!message)
+					return false;
+				if(!stream_dequeue(rf, stream, message, multiplex_length)) {
+					free(message);
+					return false;
+				}
+				// FIXME: handle message
+				free(message);
+			} else {
+				// FIXME: handle empty message
 			}
 		}
 	}
