@@ -10,6 +10,9 @@
 #include <inttypes.h>
 #include <errno.h>
 #include <poll.h>
+#include <signal.h>
+#include <sys/types.h>
+#include <sys/wait.h>
 #include <sys/uio.h>
 
 #define PY_SSIZE_T_CLEAN
@@ -107,7 +110,7 @@ static PyObject *RsyncFetch_new(PyTypeObject *subtype, PyObject *args, PyObject 
 			} else {
 				int pid = vfork();
 				if(pid == -1) {
-					return PyErr_SetFromErrno(PyExc_OSError);
+					PyErr_SetFromErrno(PyExc_OSError);
 				} else if(pid) {
 					if(close(in_pipe[1]) == -1) {
 						PyErr_SetFromErrno(PyExc_OSError);
@@ -126,11 +129,10 @@ static PyObject *RsyncFetch_new(PyTypeObject *subtype, PyObject *args, PyObject 
 								rf = PyObject_New(RsyncFetch_t, subtype);
 								if(rf) {
 									rf->magic = RSYNCFETCH_MAGIC;
+									rf->pid = pid;
 									rf->stream[STREAM_IN] = pipestream_0;
 									rf->stream[STREAM_OUT] = pipestream_0;
 									rf->stream[STREAM_ERR] = pipestream_0;
-									rf->pid = 0;
-
 									rf->stream[STREAM_IN].fd = in_pipe[0];
 									rf->stream[STREAM_OUT].fd = out_pipe[1];
 									rf->stream[STREAM_ERR].fd = err_pipe[0];
@@ -140,6 +142,7 @@ static PyObject *RsyncFetch_new(PyTypeObject *subtype, PyObject *args, PyObject 
 							}
 						}
 					}
+					while(waitpid(pid, NULL, 0) == -1 && errno == EINTR);
 				} else {
 					if(dup2(out_pipe[0], STDIN_FILENO) == -1
 					|| dup2(in_pipe[1], STDOUT_FILENO) == -1
@@ -148,7 +151,24 @@ static PyObject *RsyncFetch_new(PyTypeObject *subtype, PyObject *args, PyObject 
 						_exit(2);
 					}
 
-					char * const argv[] = { "sleep", "1", NULL };
+					if(fcntl(STDIN_FILENO, F_SETFL, 0) == -1
+					|| fcntl(STDOUT_FILENO, F_SETFL, 0) == -1
+					|| fcntl(STDERR_FILENO, F_SETFL, 0) == -1) {
+						perror("fcntl");
+						_exit(2);
+					}
+
+#ifdef SIGPIPE
+					signal(SIGPIPE, SIG_DFL);
+#endif
+#ifdef SIGXFZ
+					signal(SIGXFZ, SIG_DFL);
+#endif
+#ifdef SIGXFSZ
+					signal(SIGXFSZ, SIG_DFL);
+#endif
+
+					char * const argv[] = { "cat", NULL };
 					execvp(argv[0], argv);
 					perror("execvp");
 					_exit(2);
@@ -172,9 +192,19 @@ static int RsyncFetch_dealloc(PyObject *self) {
 	RsyncFetch_t *rf = RsyncFetch_Check(self);
 	if(rf) {
 		rf->magic = 0;
-		for(int i = 0; i < STREAM_NUM; i++)
-			if(rf->stream[i].fd != -1)
-				close(rf->stream[i].fd);
+		for(int i = 0; i < STREAM_NUM; i++) {
+			pipestream_t *stream = &rf->stream[i];
+			if(stream->fd != -1)
+				close(stream->fd);
+			bucket_t *head = stream->buf_head; 
+			while(head) {
+				bucket_t *next = head->next;
+				free(head);
+				head = next;
+			}
+		}
+		if(rf->pid)
+			while(waitpid(rf->pid, NULL, 0) == -1 && errno == EINTR);
 	}
 
 	freefunc tp_free = Py_TYPE(self)->tp_free ?: PyObject_Free;
@@ -204,7 +234,7 @@ static bool stream_read(RsyncFetch_t *rf, pipestream_t *stream) {
 		avail = sizeof tail->buf - end_offset;
 		if(!avail) {
 			prev = tail;
-			tail = malloc(sizeof tail);
+			tail = malloc(sizeof *tail);
 			if(!tail)
 				return false;
 			tail->prev = prev;
@@ -217,7 +247,7 @@ static bool stream_read(RsyncFetch_t *rf, pipestream_t *stream) {
 		}
 	} else {
 		prev = NULL;
-		tail = malloc(sizeof tail);
+		tail = malloc(sizeof *tail);
 		if(!tail)
 			return false;
 		tail->prev = NULL;
@@ -414,11 +444,33 @@ static PyObject *RsyncFetch_readbytes(PyObject *self, PyObject *howmany_obj) {
 	if(!rf)
 		return NULL;
 
-	while(rf->stream[STREAM_IN].length < howmany)
-		if(!do_io(rf))
-			return PyErr_SetFromErrno(PyExc_OSError);
+	PyObject *ret = PyBytes_FromStringAndSize(NULL, howmany);
+	if(!ret)
+		return NULL;
 
-	return PyErr_Format(PyExc_NotImplementedError, "not implemented yet - teehee");
+	if(stream_dequeue(rf, &rf->stream[STREAM_IN], PyBytes_AsString(ret), howmany))
+		return ret;
+
+	Py_DecRef(ret);
+	return PyErr_SetFromErrno(PyExc_OSError);
+}
+
+static PyObject *RsyncFetch_writebytes(PyObject *self, PyObject *bytes) {
+	RsyncFetch_t *rf = RsyncFetch_Check(self);
+	if(!rf)
+		return NULL;
+
+	char *buf;
+	Py_ssize_t len;
+	if(PyBytes_AsStringAndSize(bytes, &buf, &len) == -1)
+		return NULL;
+
+//fprintf(stderr, "%s:%d: len=%zd\n", __FILE__, __LINE__, len);
+
+	if(stream_enqueue(rf, &rf->stream[STREAM_OUT], buf, len))
+		Py_RETURN_NONE;
+
+	return PyErr_SetFromErrno(PyExc_OSError);
 }
 
 static PyObject *RsyncFetch_self(PyObject *self, PyObject *args) {
@@ -434,6 +486,7 @@ static PyMethodDef RsyncFetch_methods[] = {
 	{"__enter__", (PyCFunction)RsyncFetch_self, METH_NOARGS, "return a context manager for 'with'"},
 	{"__exit__", RsyncFetch_none, METH_VARARGS, "callback for 'with' context manager"},
 	{"readbytes", RsyncFetch_readbytes, METH_O, "read some bytes"},
+	{"writebytes", RsyncFetch_writebytes, METH_O, "write some bytes"},
 	{NULL}
 };
 
