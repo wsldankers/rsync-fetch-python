@@ -51,11 +51,38 @@ enum {
 	STREAM_NUM
 };
 
+enum message_id {
+	MSG_DATA = 0,
+	MSG_ERROR_XFER = 1,
+	MSG_INFO = 2,
+	MSG_ERROR = 3,
+	MSG_WARNING = 4,
+	MSG_ERROR_SOCKET = 5,
+	MSG_LOG = 6,
+	MSG_CLIENT = 7,
+	MSG_ERROR_UTF8 = 8,
+	MSG_REDO = 9,
+	MSG_FLIST = 20,
+	MSG_FLIST_EOF = 21,
+	MSG_IO_ERROR = 22,
+	MSG_NOOP = 42,
+	MSG_DONE = 86,
+	MSG_SUCCESS = 100,
+	MSG_DELETED = 101,
+	MSG_NO_SEND = 102,
+};
+
 typedef struct RsyncFetch {
 	PyObject_HEAD
 	uint64_t magic;
 	pipestream_t stream[3];
+	// for incoming messages:
+	pipestream_t message;
+	size_t message_length;
 	int pid;
+	enum message_id message_id;
+	bool message_active;
+	bool multiplex;
 } RsyncFetch_t;
 
 static struct PyModuleDef rsync_fetch_module;
@@ -137,6 +164,11 @@ static PyObject *RsyncFetch_new(PyTypeObject *subtype, PyObject *args, PyObject 
 									rf->stream[STREAM_OUT].fd = out_pipe[1];
 									rf->stream[STREAM_ERR].fd = err_pipe[0];
 
+									rf->message = pipestream_0;
+									rf->message_id = MSG_DATA;
+									rf->message_length = 0;
+									rf->message_active = false;
+
 									return &rf->ob_base;
 								}
 							}
@@ -202,6 +234,13 @@ static int RsyncFetch_dealloc(PyObject *self) {
 				free(head);
 				head = next;
 			}
+		}
+		pipestream_t *stream = &rf->message;
+		bucket_t *head = stream->buf_head; 
+		while(head) {
+			bucket_t *next = head->next;
+			free(head);
+			head = next;
 		}
 		if(rf->pid)
 			while(waitpid(rf->pid, NULL, 0) == -1 && errno == EINTR);
@@ -292,12 +331,47 @@ static bool stream_write(RsyncFetch_t *rf, pipestream_t *stream) {
 	return true;
 }
 
+static bool stream_copy(RsyncFetch_t *rf, pipestream_t *dst, pipestream_t *src, size_t len) {
+	if(len > src->length)
+		len = src->length;
+	if(!len)
+		return true;
+	size_t start_offset = src->start_offset;
+	for(;;) {
+		bucket_t *head = src->head;
+		bucket_t *next = head->next;
+		size_t used = (next ? sizeof head->buf : end_offset) - start_offset;
+		if(len < used) {
+			if(!stream_enqueue(rf, dst, head->buf + start_offset, len))
+				return false;
+			src->start_offset = start_offset + len;
+			src->length -= len;
+			len -= used;
+			return true;
+		} else {
+			if(!stream_enqueue(rf, dst, head->buf + start_offset, used))
+				return false;
+			if(next) {
+				free(head);
+				src->length -= used;
+				src->buf_head = next;
+				next->prev = NULL;
+				head = next;
+			} else {
+				src->length = 0;
+				src->start_offset = 0;
+				src->end_offset = 0;
+			}
+		}
+	}
+}
+
 static bool do_io(RsyncFetch_t *rf) {
 	struct pollfd pfds[3];
 	for(int i = 0; i < STREAM_NUM; i++) {
 		pipestream_t *stream = &rf->stream[i];
 		if(i == STREAM_OUT) {
-			pfds[i].fd = stream->buf_head ? stream->fd : -1;
+			pfds[i].fd = stream->length ? stream->fd : -1;
 			pfds[i].events = POLLOUT;
 		} else {
 			pfds[i].fd = stream->fd;
@@ -312,24 +386,39 @@ static bool do_io(RsyncFetch_t *rf) {
 		errno = ETIME;
 		return false;
 	}
+
 	for(int i = 0; i < orz(pfds); i++) {
 		if(pfds[i].revents & (POLLERR|POLLHUP)) {
 			if(i == STREAM_ERR) {
-				close(rf->stream[i].fd);
-				rf->stream[i].fd = -1;
+				pipestream_t *stream = &rf->stream[i];
+				close(stream->fd);
+				stream->fd = -1;
 			} else {
 				errno = EPIPE;
 				return false;
 			}
 		}
 	}
+
 	for(int i = 0; i < orz(pfds); i++) {
 		if(pfds[i].revents & POLLOUT)
 			return stream_write(rf, &rf->stream[i]);
 	}
+
 	for(int i = 0; i < orz(pfds); i++) {
-		if(pfds[i].revents & POLLIN) {
+		if(pfds[i].revents & POLLIN)
 			return stream_read(rf, &rf->stream[i]);
+	}
+
+	pipestream_t *stream = &rf->stream[STREAM_IN];
+	while(stream->length) {
+		if(rf->message_active) {
+			if(!stream_copy(&rf->message, stream, rf->message_length))
+				return false;
+			if(rf->message_length > stream->length)
+				rf->message_length -= stream->length;
+			else
+				rf->message_length = 0;
 		}
 	}
 
