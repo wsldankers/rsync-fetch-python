@@ -68,27 +68,24 @@ static inline uint64_t le64(uint64_t x) {
 
 #endif
 
-typedef struct bucket {
-	struct bucket *next;
-	struct bucket *prev;
-	char buf[65536];
-} bucket_t;
-
 typedef struct pipestream {
+	char *buf;
+	size_t size; // size of the memory allocation
+	size_t offset; // offset of start of data
+	size_t fill; // how much space in use by data
 	int fd;
-	bucket_t *buf_head;
-	bucket_t *buf_tail;
-	size_t length; // total amount of data in this stream
-	size_t end_offset; // where does the unused buffer space in the last bucket start
-	size_t start_offset; // where does the remaining data in the first bucket start
 } pipestream_t;
 static const pipestream_t pipestream_0 = {.fd = -1};
 
+#define RF_STREAM_IN_BUFSIZE 65536
+#define RF_STREAM_OUT_BUFSIZE 65536
+#define RF_STREAM_ERR_BUFSIZE 4096
+
 enum {
-	STREAM_IN,
-	STREAM_OUT,
-	STREAM_ERR,
-	STREAM_NUM
+	RF_STREAM_IN,
+	RF_STREAM_OUT,
+	RF_STREAM_ERR,
+	RF_STREAM_NUM
 };
 
 enum message_id {
@@ -111,6 +108,17 @@ enum message_id {
 	MSG_DELETED = 101,
 	MSG_NO_SEND = 102,
 };
+
+typedef enum {
+	RF_ERROR_OK,
+	RF_ERROR_ERRNO,
+	RF_ERROR_TIMEOUT,
+	RF_ERROR_HANGUP,
+	RF_ERROR_PREMATURE_EOF,
+	RF_ERROR_ASSERT,
+} rf_error_t;
+
+#define RF_PROPAGATE_ERROR(x) do { rf_error_t __e_##__LINE__ = (x); if(__e_##__LINE__ != RF_ERROR_OK) return __e_##__LINE__; } while(0)
 
 typedef struct RsyncFetch {
 	PyObject_HEAD
@@ -193,12 +201,16 @@ static PyObject *RsyncFetch_new(PyTypeObject *subtype, PyObject *args, PyObject 
 								if(rf) {
 									rf->magic = RSYNCFETCH_MAGIC;
 									rf->pid = pid;
-									rf->stream[STREAM_IN] = pipestream_0;
-									rf->stream[STREAM_OUT] = pipestream_0;
-									rf->stream[STREAM_ERR] = pipestream_0;
-									rf->stream[STREAM_IN].fd = in_pipe[0];
-									rf->stream[STREAM_OUT].fd = out_pipe[1];
-									rf->stream[STREAM_ERR].fd = err_pipe[0];
+									rf->stream[RF_STREAM_IN] = pipestream_0;
+									rf->stream[RF_STREAM_OUT] = pipestream_0;
+									rf->stream[RF_STREAM_ERR] = pipestream_0;
+									rf->stream[RF_STREAM_IN].fd = in_pipe[0];
+									rf->stream[RF_STREAM_OUT].fd = out_pipe[1];
+									rf->stream[RF_STREAM_ERR].fd = err_pipe[0];
+									rf->stream[RF_STREAM_IN].size = RF_STREAM_IN_BUFSIZE;
+									rf->stream[RF_STREAM_OUT].size = RF_STREAM_OUT_BUFSIZE;
+									rf->stream[RF_STREAM_ERR].size = RF_STREAM_ERR_BUFSIZE;
+									rf->multiplex = true;
 									rf->multiplex_remaining = 0;
 
 									return &rf->ob_base;
@@ -256,16 +268,11 @@ static int RsyncFetch_dealloc(PyObject *self) {
 	RsyncFetch_t *rf = RsyncFetch_Check(self);
 	if(rf) {
 		rf->magic = 0;
-		for(int i = 0; i < STREAM_NUM; i++) {
+		for(int i = 0; i < RF_STREAM_NUM; i++) {
 			pipestream_t *stream = &rf->stream[i];
 			if(stream->fd != -1)
 				close(stream->fd);
-			bucket_t *head = stream->buf_head; 
-			while(head) {
-				bucket_t *next = head->next;
-				free(head);
-				head = next;
-			}
+			free(stream->buf);
 		}
 		if(rf->pid)
 			while(waitpid(rf->pid, NULL, 0) == -1 && errno == EINTR);
@@ -277,144 +284,207 @@ static int RsyncFetch_dealloc(PyObject *self) {
 	return 0;
 }
 
-static bool stream_read(RsyncFetch_t *rf, pipestream_t *stream) {
-	bucket_t *tail = stream->buf_tail;
-	size_t avail;
-	size_t end_offset = stream->end_offset;
-	bucket_t *prev;
-	if(tail) {
-		prev = tail->prev;
-		if(!prev) {
-			size_t start_offset = stream->start_offset;
-			size_t used = end_offset - start_offset;
-			if(used <= 256) {
-				memmove(tail->buf, tail->buf + start_offset, used);
-				stream->start_offset = 0;
-				stream->end_offset = used;
-				end_offset = used;
-			}
-		}
+static rf_error_t rf_write_out_stream(RsyncFetch_t *rf) {
+	pipestream_t *stream = &rf->stream[RF_STREAM_OUT];
+	size_t fill = stream->fill;
+	size_t size = stream->size;
+	size_t offset = stream->offset;
+	char *buf = stream->buf;
 
-		avail = sizeof tail->buf - end_offset;
-		if(!avail) {
-			prev = tail;
-			tail = malloc(sizeof *tail);
-			if(!tail)
-				return false;
-			tail->prev = prev;
-			tail->next = NULL;
-			prev->next = tail;
-			stream->buf_tail = tail;
-			stream->end_offset = 0;
-			end_offset = 0;
-			avail = sizeof tail->buf;
-		}
+	ssize_t r;
+	if(offset + fill > size) {
+		size_t amount = size - offset;
+		struct iovec iov[2] = {
+			{ buf + offset, amount },
+			{ buf, fill - amount },
+		};
+		r = writev(stream->fd, iov, orz(iov));
 	} else {
-		prev = NULL;
-		tail = malloc(sizeof *tail);
-		if(!tail)
-			return false;
-		tail->prev = NULL;
-		tail->next = NULL;
-		stream->buf_head = tail;
-		stream->buf_tail = tail;
-		avail = sizeof tail->buf;
+		r = write(stream->fd, buf + offset, fill);
 	}
 
-	ssize_t r = read(stream->fd, tail->buf + end_offset, avail);
 	if(r == -1)
-		return false;
+		return RF_ERROR_ERRNO;
 
-	stream->end_offset = end_offset + r;
-	stream->length += r;
+	fill -= r;
+	if(fill) {
+		stream->fill = fill;
+		offset += r;
+		stream->offset = offset < size ? offset : offset - size;
+	} else {
+		stream->fill = 0;
+		stream->offset = 0;
+	}
 
-	return true;
+	return RF_ERROR_OK;
 }
 
-static bool stream_write(RsyncFetch_t *rf, pipestream_t *stream) {
-	bucket_t *head = stream->buf_head;
-	assert(head);
-	bucket_t *next = head->next;
-	size_t start_offset = stream->start_offset;
-	size_t head_usage = (next ? sizeof head->buf : stream->end_offset) - start_offset;
-	size_t r = write(stream->fd, head->buf + start_offset, head_usage);
-	if(r == -1)
-		return false;
-	stream->length -= r;
-	if(r == head_usage) {
-		stream->start_offset = 0;
-		if(next) {
-			free(head);
-			stream->buf_head = next;
-			next->prev = NULL;
-		} else {
-			stream->end_offset = 0;
-		}
-	} else {
-		stream->start_offset = start_offset + r;
+static rf_error_t rf_read_error_stream(RsyncFetch_t *rf) {
+	pipestream_t *stream = &rf->stream[RF_STREAM_ERR];
+	size_t fill = stream->fill;
+	size_t size = stream->size;
+	char *buf = stream->buf;
+
+	if(!buf) {
+		buf = malloc(size);
+		if(!buf)
+			return RF_ERROR_ERRNO;
+		stream->buf = buf;
 	}
-	return true;
+
+	char *old_buf_end = buf + fill;
+	ssize_t r = read(stream->fd, old_buf_end, size - fill);
+	if(r == -1)
+		return RF_ERROR_ERRNO;
+
+	char *new_buf_end = old_buf_end + r;
+	char *todo = buf;
+	for(char *eol = memchr(old_buf_end, '\n', r); eol++; eol = memchr(eol, '\n', new_buf_end - eol)) {
+		// FIXME: handle through callback
+		if(write(STDERR_FILENO, todo, eol - todo) == -1) {
+			stream->fill = 0;
+			return RF_ERROR_ERRNO;
+		}
+		todo = eol;
+	}
+
+	if(todo != buf) {
+		fill = new_buf_end - todo;
+		if(fill)
+			memmove(buf, todo, fill);
+		stream->fill = fill;
+	} else if(fill + r == size) {
+		stream->fill = 0;
+		// FIXME: handle through callback
+		if(write(STDERR_FILENO, buf, size) == -1)
+			return RF_ERROR_ERRNO;
+	}
+
+	return RF_ERROR_OK;
 }
 
-static bool do_io(RsyncFetch_t *rf) {
-	struct pollfd pfds[3];
-	for(int i = 0; i < STREAM_NUM; i++) {
-		pipestream_t *stream = &rf->stream[i];
-		if(i == STREAM_OUT) {
-			pfds[i].fd = stream->length ? stream->fd : -1;
-			pfds[i].events = POLLOUT;
-		} else {
-			pfds[i].fd = stream->fd;
-			pfds[i].events = POLLIN;
+static rf_error_t rf_read_bytes_raw(RsyncFetch_t *rf, char *dst, size_t len) {
+	pipestream_t *stream = &rf->stream[RF_STREAM_IN];
+	size_t fill = stream->fill;
+	size_t size = stream->size;
+	size_t offset = stream->offset;
+	char *buf = stream->buf;
+	if(len > fill) {
+		if(!buf) {
+			buf = malloc(size);
+			if(!buf)
+				return RF_ERROR_ERRNO;
+			stream->buf = buf;
 		}
-	}
+		if(offset + fill > size) {
+			size_t amount = size - offset;
+			memcpy(dst, stream->buf + offset, amount);
+			memcpy(dst + amount, buf, fill - amount);
+		} else {
+			memcpy(dst, buf + offset, fill);
+		}
+		dst += fill;
+		len -= fill;
+		stream->offset = 0;
+		stream->fill = 0;
 
-	int r = poll(pfds, orz(pfds), 500);
-	if(r == -1)
-		return false;
-	if(r == 0) {
-		errno = ETIME;
-		return false;
-	}
-
-	for(int i = 0; i < orz(pfds); i++) {
-		if(pfds[i].revents & (POLLERR|POLLHUP)) {
-			if(i == STREAM_ERR) {
+		for(;;) {
+			struct pollfd pfds[3];
+			for(int i = 0; i < RF_STREAM_NUM; i++) {
 				pipestream_t *stream = &rf->stream[i];
-				close(stream->fd);
-				stream->fd = -1;
-			} else {
-				errno = EPIPE;
-				return false;
+				if(i == RF_STREAM_OUT) {
+					pfds[i].fd = stream->fill ? stream->fd : -1;
+					pfds[i].events = POLLOUT;
+				} else {
+					pfds[i].fd = stream->fd;
+					pfds[i].events = POLLIN;
+				}
+			}
+
+			int r = poll(pfds, orz(pfds), 500);
+			if(r == -1)
+				return RF_ERROR_ERRNO;
+			if(r == 0)
+				return RF_ERROR_TIMEOUT;
+
+			for(int i = 0; i < orz(pfds); i++) {
+				if(pfds[i].revents & (POLLERR|POLLHUP)) {
+					if(i == RF_STREAM_ERR) {
+						pipestream_t *stream = &rf->stream[i];
+						close(stream->fd);
+						stream->fd = -1;
+					} else {
+						return RF_ERROR_HANGUP;
+					}
+				}
+			}
+
+			if(pfds[RF_STREAM_OUT].revents & POLLOUT) {
+				RF_PROPAGATE_ERROR(rf_write_out_stream(rf));
+				continue;
+			}
+
+			for(int i = 0; i < orz(pfds); i++) {
+				if(pfds[i].revents & POLLOUT)
+					return RF_ERROR_ASSERT;
+
+				if(pfds[i].revents & POLLIN) {
+					pipestream_t *stream = &rf->stream[i];
+					if(i == RF_STREAM_IN) {
+						struct iovec iov[2] = {
+							{ dst, len },
+							{ buf, size },
+						};
+						ssize_t r = readv(stream->fd, iov, orz(iov));
+						if(r == -1)
+							return RF_ERROR_ERRNO;
+						if(r < len) {
+							dst += r;
+							len -= r;
+						} else {
+							stream->fill = r - len;
+							return RF_ERROR_OK;
+						}
+					} else {
+						if(i != RF_STREAM_ERR)
+							return RF_ERROR_ASSERT;
+						RF_PROPAGATE_ERROR(rf_read_error_stream(rf));
+					}
+				}
 			}
 		}
+	} else {
+		if(offset + len > size) {
+			size_t amount = size - offset;
+			memcpy(dst, buf + offset, amount);
+			memcpy(dst + amount, stream->buf, len - amount);
+		} else {
+			memcpy(dst, buf + offset, len);
+		}
+
+		if(len == fill) {
+			stream->offset = 0;
+			stream->fill = 0;
+		} else {
+			offset += len;
+			stream->offset = offset < size ? offset : offset - size;
+			stream->fill = fill - len;
+		}
 	}
 
-	for(int i = 0; i < orz(pfds); i++) {
-		if(pfds[i].revents & POLLOUT)
-			return stream_write(rf, &rf->stream[i]);
-	}
-
-	for(int i = 0; i < orz(pfds); i++) {
-		if(pfds[i].revents & POLLIN)
-			return stream_read(rf, &rf->stream[i]);
-	}
-
-	return true;
+	return RF_ERROR_OK;
 }
 
-static bool wait_for_eof(RsyncFetch_t *rf) {
+static rf_error_t wait_for_eof(RsyncFetch_t *rf) {
 	for(;;) {
-		if(rf->stream[STREAM_IN].length) {
-			errno = EBUSY;
-			return false;
-		}
+		if(rf->stream[RF_STREAM_IN].fill)
+			return RF_ERROR_PREMATURE_EOF;
 
 		struct pollfd pfds[3];
-		for(int i = 0; i < STREAM_NUM; i++) {
+		for(int i = 0; i < RF_STREAM_NUM; i++) {
 			pipestream_t *stream = &rf->stream[i];
-			if(i == STREAM_OUT) {
-				pfds[i].fd = stream->length ? stream->fd : -1;
+			if(i == RF_STREAM_OUT) {
+				pfds[i].fd = stream->fill ? stream->fd : -1;
 				pfds[i].events = POLLOUT;
 			} else {
 				pfds[i].fd = stream->fd;
@@ -424,165 +494,56 @@ static bool wait_for_eof(RsyncFetch_t *rf) {
 
 		int r = poll(pfds, orz(pfds), 500);
 		if(r == -1)
-			return false;
-		if(r == 0) {
-			errno = ETIME;
-			return false;
-		}
+			return RF_ERROR_ERRNO;
+		if(r == 0)
+			return RF_ERROR_TIMEOUT;
 
 		for(int i = 0; i < orz(pfds); i++) {
 			pipestream_t *stream = &rf->stream[i];
-			if(pfds[i].revents & POLLIN)
-				if(!stream_read(rf, stream))
-					return false;
-			if(pfds[i].revents & POLLOUT)
-				if(!stream_write(rf, stream))
-					return false;
+			if(pfds[i].revents & POLLIN) {
+				if(i == RF_STREAM_IN)
+					return RF_ERROR_PREMATURE_EOF;
+				if(i != RF_STREAM_ERR)
+					return RF_ERROR_ASSERT;
+				RF_PROPAGATE_ERROR(rf_read_error_stream(rf));
+			}
+			if(pfds[i].revents & POLLOUT) {
+				if(i != RF_STREAM_OUT)
+					return RF_ERROR_ASSERT;
+				RF_PROPAGATE_ERROR(rf_write_out_stream(rf));
+			}
 			if(pfds[i].revents & (POLLERR|POLLHUP)) {
 				close(stream->fd);
 				stream->fd = -1;
-				if(i == STREAM_IN)
-					return true;
+				if(i == RF_STREAM_IN)
+					return RF_ERROR_OK;
 			}
 		}
 	}
 }
 
-static bool stream_enqueue(RsyncFetch_t *rf, pipestream_t *stream, const char *buf, size_t len) {
-	bucket_t *tail = stream->buf_tail;
-	if(tail) {
-		size_t end_offset = stream->end_offset;
-		if(!tail->prev) {
-			size_t start_offset = stream->start_offset;
-			size_t used = end_offset - start_offset;
-			if(used <= 256) {
-				memmove(tail->buf, tail->buf + start_offset, used);
-				stream->start_offset = 0;
-				stream->end_offset = used;
-				end_offset = used;
-			}
-		}
-		size_t avail = sizeof tail->buf - end_offset;
-		if(avail) {
-			if(len > avail) {
-				memcpy(tail->buf + end_offset, buf, avail);
-				len -= avail;
-				buf += avail;
-				stream->end_offset = sizeof tail->buf;
-				stream->length += avail;
-			} else {
-				memcpy(tail->buf + end_offset, buf, len);
-				stream->end_offset = end_offset + len;
-				stream->length += len;
-				return true;
-			}
-		}
-	}
-
-	for(;;) {
-		bucket_t *prev = tail;
-		tail = malloc(sizeof *tail);
-		if(!tail)
-			return false;
-		tail->prev = prev;
-		tail->next = NULL;
-		if(prev)
-			prev->next = tail;
-		else
-			stream->buf_head = tail;
-		stream->buf_tail = tail;
-
-		if(len > sizeof tail->buf) {
-			memcpy(tail->buf, buf, sizeof tail->buf);
-			buf += sizeof tail->buf;
-			len -= sizeof tail->buf;
-			stream->end_offset = sizeof tail->buf;
-			stream->length += sizeof tail->buf;
-		} else {
-			memcpy(tail->buf, buf, len);
-			stream->end_offset = len;
-			stream->length += len;
-			return true;
-		}
-	}
-}
-
-static bool stream_dequeue(RsyncFetch_t *rf, pipestream_t *stream, char *buf, size_t len) {
-	if(!len)
-		return true;
-	while(stream->length < len)
-		if(!do_io(rf))
-			return false;
-	for(;;) {
-		bucket_t *head = stream->buf_head;
-		bucket_t *next = head->next;
-		size_t start_offset = stream->start_offset;
-		size_t avail = (next ? sizeof head->buf : stream->end_offset) - start_offset;
-		if(avail > len) {
-			memcpy(buf, head->buf + start_offset, len);
-			stream->start_offset = start_offset + len;
-			stream->length -= len;
-			return true;
-		} else {
-			memcpy(buf, head->buf + start_offset, avail);
-			stream->length -= avail;
-			stream->start_offset = 0;
-			if(next) {
-				free(head);
-				head = next;
-				len -= avail;
-				buf += avail;
-				start_offset = 0;
-				next->prev = NULL;
-				stream->buf_head = next;
-			} else {
-				assert(len == avail);
-				stream->end_offset = 0;
-				return true;
-			}
-		}
-	}
-}
-
-static bool stream_multiplex(RsyncFetch_t *rf, pipestream_t *stream, char *buf, size_t len) {
+static rf_error_t rf_read_bytes(RsyncFetch_t *rf, char *buf, size_t len) {
 	if(!rf->multiplex)
-		return stream_enqueue(rf, stream, buf, len);
-	while(len) {
-		size_t chunk = len < 0xFFFFFF ? len : 0xFFFFFF;
-		uint8_t mplex[4] = { chunk, chunk >> 8, chunk >> 16, MSG_DATA };
-		if(!stream_enqueue(rf, stream, (char *)mplex, sizeof mplex))
-			return false;
-		if(!stream_enqueue(rf, stream, buf, chunk))
-			return false;
-		len -= chunk;
-		buf += chunk;
-	}
-	return true;
-}
+		return rf_read_bytes_raw(rf, buf, len);
 
-static bool stream_demultiplex(RsyncFetch_t *rf, pipestream_t *stream, char *buf, size_t len) {
-	if(!rf->multiplex)
-		return stream_dequeue(rf, stream, buf, len);
 	size_t multiplex_remaining = rf->multiplex_remaining;
 	for(;;) {
 		if(multiplex_remaining < len) {
 			if(multiplex_remaining) {
-				if(!stream_dequeue(rf, stream, buf, multiplex_remaining))
-					return false;
+				RF_PROPAGATE_ERROR(rf_read_bytes_raw(rf, buf, multiplex_remaining));
 				buf += multiplex_remaining;
 				len -= multiplex_remaining;
 			}
 		} else {
 			rf->multiplex_remaining = multiplex_remaining - len;
-			return stream_dequeue(rf, stream, buf, len);
+			return rf_read_bytes_raw(rf, buf, len);
 		}
 
 		for(;;) {
 			uint8_t mplex[4];
-			if(!stream_dequeue(rf, stream, (char *)mplex, sizeof mplex))
-				return false;
+			RF_PROPAGATE_ERROR(rf_read_bytes_raw(rf, (char *)mplex, sizeof mplex));
+			multiplex_remaining = mplex[0] | mplex[1] << 8 | mplex[2] << 16;
 			uint8_t channel = mplex[3];
-			size_t multiplex_remaining = mplex[0] | mplex[1] << 8 | mplex[2] << 16;
 
 			if(channel == MSG_DATA)
 				break;
@@ -591,9 +552,10 @@ static bool stream_demultiplex(RsyncFetch_t *rf, pipestream_t *stream, char *buf
 				char *message = malloc(multiplex_remaining);
 				if(!message)
 					return false;
-				if(!stream_dequeue(rf, stream, message, multiplex_remaining)) {
+				rf_error_t e = rf_read_bytes_raw(rf, message, multiplex_remaining);
+				if(e != RF_ERROR_OK) {
 					free(message);
-					return false;
+					return e;
 				}
 				// FIXME: handle message
 				free(message);
@@ -604,49 +566,116 @@ static bool stream_demultiplex(RsyncFetch_t *rf, pipestream_t *stream, char *buf
 	}
 }
 
-static bool stream_flush(RsyncFetch_t *rf, pipestream_t *stream) {
-	while(stream->length)
-		if(!do_io(rf))
-			return false;
-	return true;
+static rf_error_t rf_write_bytes_raw(RsyncFetch_t *rf, char *src, size_t len) {
+	pipestream_t *stream = &rf->stream[RF_STREAM_OUT];
+	size_t fill = stream->fill;
+	size_t size = stream->size;
+	size_t offset = stream->offset;
+	char *buf = stream->buf;
+
+	if(buf) {
+		if(fill + len > size) {
+			size_t newsize = size << 1;
+			while(fill + len > newsize)
+				newsize <<= 1;
+			if(offset) {
+				char *newbuf = malloc(newsize);
+				if(!newbuf)
+					return RF_ERROR_ERRNO;
+				if(offset + fill > size) {
+					size_t amount = size - offset;
+					memcpy(newbuf, buf + offset, amount);
+					memcpy(newbuf + amount, buf, fill - amount);
+				} else {
+					memcpy(newbuf, buf + offset, size);
+				}
+				stream->offset = offset = 0;
+				free(buf);
+				buf = newbuf;
+			} else {
+				buf = realloc(buf, newsize);
+				if(!buf)
+					return RF_ERROR_ERRNO;
+			}
+			stream->buf = buf;
+			stream->size = size = newsize;
+		}
+	} else {
+		while(len > size)
+			size <<= 1;
+		buf = malloc(size);
+		if(!buf)
+			return RF_ERROR_ERRNO;
+		stream->buf = buf;
+	}
+
+	size_t start = offset + fill;
+	if(start > size)
+		start -= size;
+
+	if(start + len > size) {
+		size_t amount = size - start;
+		memcpy(buf + start, src, amount);
+		memcpy(buf, src + amount, len - amount);
+	} else {
+		memcpy(buf + start, src, len);
+	}
+
+	stream->fill = fill + len;
+
+	return RF_ERROR_OK;
 }
 
-static bool send_int8(RsyncFetch_t *rf, int8_t d) {
-	return stream_multiplex(rf, &rf->stream[STREAM_OUT], (char *)&d, sizeof d);
+static rf_error_t rf_write_bytes(RsyncFetch_t *rf, char *buf, size_t len) {
+	if(!rf->multiplex)
+		return rf_write_bytes_raw(rf, buf, len);
+	while(len) {
+		size_t chunk = len < 0xFFFFFF ? len : 0xFFFFFF;
+		uint8_t mplex[4] = { chunk, chunk >> 8, chunk >> 16, MSG_DATA };
+		RF_PROPAGATE_ERROR(rf_write_bytes_raw(rf, (char *)mplex, sizeof mplex));
+		RF_PROPAGATE_ERROR(rf_write_bytes_raw(rf, buf, chunk));
+		len -= chunk;
+		buf += chunk;
+	}
+	return RF_ERROR_OK;
 }
 
-static bool send_uint8(RsyncFetch_t *rf, uint8_t d) {
-	return stream_multiplex(rf, &rf->stream[STREAM_OUT], (char *)&d, sizeof d);
+static rf_error_t send_int8(RsyncFetch_t *rf, int8_t d) {
+	return rf_write_bytes(rf, (char *)&d, sizeof d);
 }
 
-static bool send_int16(RsyncFetch_t *rf, int16_t d) {
+static rf_error_t send_uint8(RsyncFetch_t *rf, uint8_t d) {
+	return rf_write_bytes(rf, (char *)&d, sizeof d);
+}
+
+static rf_error_t send_int16(RsyncFetch_t *rf, int16_t d) {
 	int16_t le = le16(d);
-	return stream_multiplex(rf, &rf->stream[STREAM_OUT], (char *)&le, sizeof le);
+	return rf_write_bytes(rf, (char *)&le, sizeof le);
 }
 
-static bool send_uint16(RsyncFetch_t *rf, uint16_t d) {
+static rf_error_t send_uint16(RsyncFetch_t *rf, uint16_t d) {
 	uint16_t le = le16(d);
-	return stream_multiplex(rf, &rf->stream[STREAM_OUT], (char *)&le, sizeof le);
+	return rf_write_bytes(rf, (char *)&le, sizeof le);
 }
 
-static bool send_int32(RsyncFetch_t *rf, int32_t d) {
+static rf_error_t send_int32(RsyncFetch_t *rf, int32_t d) {
 	int32_t le = le32(d);
-	return stream_multiplex(rf, &rf->stream[STREAM_OUT], (char *)&le, sizeof le);
+	return rf_write_bytes(rf, (char *)&le, sizeof le);
 }
 
-static bool send_uint32(RsyncFetch_t *rf, uint32_t d) {
+static rf_error_t send_uint32(RsyncFetch_t *rf, uint32_t d) {
 	uint32_t le = le32(d);
-	return stream_multiplex(rf, &rf->stream[STREAM_OUT], (char *)&le, sizeof le);
+	return rf_write_bytes(rf, (char *)&le, sizeof le);
 }
 
-static bool send_int64(RsyncFetch_t *rf, int64_t d) {
+static rf_error_t send_int64(RsyncFetch_t *rf, int64_t d) {
 	int64_t le = le64(d);
-	return stream_multiplex(rf, &rf->stream[STREAM_OUT], (char *)&le, sizeof le);
+	return rf_write_bytes(rf, (char *)&le, sizeof le);
 }
 
-static bool send_uint64(RsyncFetch_t *rf, uint64_t d) {
+static rf_error_t send_uint64(RsyncFetch_t *rf, uint64_t d) {
 	uint64_t le = le64(d);
-	return stream_multiplex(rf, &rf->stream[STREAM_OUT], (char *)&le, sizeof le);
+	return rf_write_bytes(rf, (char *)&le, sizeof le);
 }
 
 static PyObject *RsyncFetch_readbytes(PyObject *self, PyObject *howmany_obj) {
@@ -665,7 +694,7 @@ static PyObject *RsyncFetch_readbytes(PyObject *self, PyObject *howmany_obj) {
 	if(!ret)
 		return NULL;
 
-	if(stream_demultiplex(rf, &rf->stream[STREAM_IN], PyBytes_AsString(ret), howmany))
+	if(rf_read_bytes(rf, PyBytes_AsString(ret), howmany) == RF_ERROR_OK)
 		return ret;
 
 	Py_DecRef(ret);
@@ -684,7 +713,7 @@ static PyObject *RsyncFetch_writebytes(PyObject *self, PyObject *bytes) {
 
 //fprintf(stderr, "%s:%d: len=%zd\n", __FILE__, __LINE__, len);
 
-	if(stream_multiplex(rf, &rf->stream[STREAM_OUT], buf, len))
+	if(rf_write_bytes(rf, buf, len) == RF_ERROR_OK)
 		Py_RETURN_NONE;
 
 	return PyErr_SetFromErrno(PyExc_OSError);
