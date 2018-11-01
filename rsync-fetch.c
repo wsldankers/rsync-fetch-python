@@ -75,11 +75,13 @@ typedef struct pipestream {
 	size_t fill; // how much space in use by data
 	int fd;
 } pipestream_t;
-static const pipestream_t pipestream_0 = {.fd = -1};
+#define PIPESTREAM_INITIALIZER {.fd = -1}
+static const pipestream_t pipestream_0 = PIPESTREAM_INITIALIZER;
 
 #define RF_STREAM_IN_BUFSIZE 65536
 #define RF_STREAM_OUT_BUFSIZE 65536
 #define RF_STREAM_ERR_BUFSIZE 4096
+#define RF_BUFSIZE_ADJUSTMENT (3 * sizeof(void *))
 
 enum {
 	RF_STREAM_IN,
@@ -112,33 +114,59 @@ enum message_id {
 typedef enum {
 	RF_STATUS_OK,
 	RF_STATUS_ERRNO,
+	RF_STATUS_PYTHON,
 	RF_STATUS_TIMEOUT,
 	RF_STATUS_HANGUP,
-	RF_STATUS_PREMATURE_EOF,
 	RF_STATUS_ASSERT,
 	RF_STATUS_PROTO,
 } rf_status_t;
 
 #define RF_PROPAGATE_ERROR(x) do { rf_status_t __e_##__LINE__ = (x); if(__e_##__LINE__ != RF_STATUS_OK) return __e_##__LINE__; } while(0)
 
+#define RSYNCFETCH_MAGIC UINT64_C(0x6FB32179D3F495D0)
+
 typedef struct RsyncFetch {
-	PyObject_HEAD
 	uint64_t magic;
 	pipestream_t stream[3];
 	size_t multiplex_remaining;
+	int32_t prev_negative_ndx_in;
+	int32_t prev_positive_ndx_in;
+	int32_t prev_negative_ndx_out;
+	int32_t prev_positive_ndx_out;
 	int pid;
 	bool multiplex;
+	bool failed;
+	bool closed;
 } RsyncFetch_t;
+
+static const RsyncFetch_t RsyncFetch_0 = {
+	.magic = RSYNCFETCH_MAGIC,
+	.stream = { PIPESTREAM_INITIALIZER, PIPESTREAM_INITIALIZER, PIPESTREAM_INITIALIZER },
+	.multiplex = false,
+};
+
+struct RsyncFetchObject {
+	PyObject_HEAD
+	RsyncFetch_t rf;
+};
 
 static struct PyModuleDef rsync_fetch_module;
 static PyTypeObject RsyncFetch_type;
 
-#define RSYNCFETCH_MAGIC UINT64_C(0x6FB32179D3F495D0)
-
-static inline RsyncFetch_t *RsyncFetch_Check(PyObject *v) {
-	return v && PyObject_TypeCheck(v, &RsyncFetch_type) && ((RsyncFetch_t *)v)->magic == RSYNCFETCH_MAGIC
-		? (RsyncFetch_t *)v
-		: NULL;
+static inline RsyncFetch_t *RsyncFetch_Check(PyObject *v, bool check_failed) {
+	if(v && PyObject_TypeCheck(v, &RsyncFetch_type)
+	&& ((struct RsyncFetchObject *)v)->rf.magic == RSYNCFETCH_MAGIC) {
+		RsyncFetch_t *rf = &((struct RsyncFetchObject *)v)->rf;
+		if(check_failed && rf->failed) {
+			PyErr_Format(PyExc_RuntimeError, "RsyncFetch object is in failed state");
+			return NULL;
+		} else {
+			return rf;
+		}
+	} else {
+		PyErr_Format(PyExc_TypeError, "not a valid RsyncFetch object");
+		return NULL;
+	}
 }
 
 #ifndef HAVE_PIPE2
@@ -197,24 +225,19 @@ static PyObject *RsyncFetch_new(PyTypeObject *subtype, PyObject *args, PyObject 
 							} else {
 								err_pipe[1] = -1;
 
-								RsyncFetch_t *rf;
-								rf = PyObject_New(RsyncFetch_t, subtype);
-								if(rf) {
-									rf->magic = RSYNCFETCH_MAGIC;
+								struct RsyncFetchObject *obj = PyObject_New(struct RsyncFetchObject, subtype);
+								if(obj) {
+									RsyncFetch_t *rf = &obj->rf;
+									*rf = RsyncFetch_0;
 									rf->pid = pid;
-									rf->stream[RF_STREAM_IN] = pipestream_0;
-									rf->stream[RF_STREAM_OUT] = pipestream_0;
-									rf->stream[RF_STREAM_ERR] = pipestream_0;
 									rf->stream[RF_STREAM_IN].fd = in_pipe[0];
 									rf->stream[RF_STREAM_OUT].fd = out_pipe[1];
 									rf->stream[RF_STREAM_ERR].fd = err_pipe[0];
-									rf->stream[RF_STREAM_IN].size = RF_STREAM_IN_BUFSIZE;
-									rf->stream[RF_STREAM_OUT].size = RF_STREAM_OUT_BUFSIZE;
-									rf->stream[RF_STREAM_ERR].size = RF_STREAM_ERR_BUFSIZE;
-									rf->multiplex = true;
-									rf->multiplex_remaining = 0;
+									rf->stream[RF_STREAM_IN].size = RF_STREAM_IN_BUFSIZE - RF_BUFSIZE_ADJUSTMENT;
+									rf->stream[RF_STREAM_OUT].size = RF_STREAM_OUT_BUFSIZE - RF_BUFSIZE_ADJUSTMENT;
+									rf->stream[RF_STREAM_ERR].size = RF_STREAM_ERR_BUFSIZE - RF_BUFSIZE_ADJUSTMENT;
 
-									return &rf->ob_base;
+									return &obj->ob_base;
 								}
 							}
 						}
@@ -266,7 +289,7 @@ static PyObject *RsyncFetch_new(PyTypeObject *subtype, PyObject *args, PyObject 
 }
 
 static int RsyncFetch_dealloc(PyObject *self) {
-	RsyncFetch_t *rf = RsyncFetch_Check(self);
+	RsyncFetch_t *rf = RsyncFetch_Check(self, false);
 	if(rf) {
 		rf->magic = 0;
 		for(int i = 0; i < RF_STREAM_NUM; i++) {
@@ -484,7 +507,7 @@ __attribute__((unused))
 static rf_status_t wait_for_eof(RsyncFetch_t *rf) {
 	for(;;) {
 		if(rf->stream[RF_STREAM_IN].fill)
-			return RF_STATUS_PREMATURE_EOF;
+			return RF_STATUS_PROTO;
 
 		struct pollfd pfds[3];
 		for(int i = 0; i < RF_STREAM_NUM; i++) {
@@ -508,7 +531,7 @@ static rf_status_t wait_for_eof(RsyncFetch_t *rf) {
 			pipestream_t *stream = &rf->stream[i];
 			if(pfds[i].revents & POLLIN) {
 				if(i == RF_STREAM_IN)
-					return RF_STATUS_PREMATURE_EOF;
+					return RF_STATUS_PROTO;
 				if(i != RF_STREAM_ERR)
 					return RF_STATUS_ASSERT;
 				RF_PROPAGATE_ERROR(rf_read_error_stream(rf));
@@ -581,9 +604,10 @@ static rf_status_t rf_send_bytes_raw(RsyncFetch_t *rf, char *src, size_t len) {
 
 	if(buf) {
 		if(fill + len > size) {
-			size_t newsize = size << 1;
+			size_t newsize = (size + RF_BUFSIZE_ADJUSTMENT) << 1;
 			while(fill + len > newsize)
 				newsize <<= 1;
+			newsize -= RF_BUFSIZE_ADJUSTMENT;
 			if(offset) {
 				char *newbuf = malloc(newsize);
 				if(!newbuf)
@@ -607,8 +631,10 @@ static rf_status_t rf_send_bytes_raw(RsyncFetch_t *rf, char *src, size_t len) {
 			stream->size = size = newsize;
 		}
 	} else {
+		size += RF_BUFSIZE_ADJUSTMENT;
 		while(len > size)
 			size <<= 1;
+		size -= RF_BUFSIZE_ADJUSTMENT;
 		buf = malloc(size);
 		if(!buf)
 			return RF_STATUS_ERRNO;
@@ -798,6 +824,33 @@ static rf_status_t recv_varlong(RsyncFetch_t *rf, uint32_t *d, size_t min_bytes)
 	return RF_STATUS_OK;
 }
 
+static bool rf_status_to_exception(RsyncFetch_t *rf, rf_status_t s) {
+	switch(s) {
+		case RF_STATUS_OK:
+			return true;
+		case RF_STATUS_ERRNO:
+			PyErr_SetFromErrno(PyExc_OSError);
+			break;
+		case RF_STATUS_PYTHON:
+			break;
+		case RF_STATUS_TIMEOUT:
+			return PyErr_Format(PyExc_RuntimeError, "operation timed out");
+			break;
+		case RF_STATUS_HANGUP:
+			return PyErr_Format(PyExc_RuntimeError, "process exited prematurely");
+			break;
+		case RF_STATUS_PROTO:
+			return PyErr_Format(PyExc_RuntimeError, "protocol error");
+			break;
+		default:
+		case RF_STATUS_ASSERT:
+			return PyErr_Format(PyExc_RuntimeError, "internal error");
+			break;
+	}
+	rf->failed = true;
+	return false;
+}
+
 static PyObject *RsyncFetch_readbytes(PyObject *self, PyObject *howmany_obj) {
 	PyErr_Clear();
 	Py_ssize_t howmany = PyNumber_AsSsize_t(howmany_obj, PyExc_OverflowError);
@@ -806,7 +859,7 @@ static PyObject *RsyncFetch_readbytes(PyObject *self, PyObject *howmany_obj) {
 	if(howmany < 0)
 		return PyErr_Format(PyExc_ValueError, "cannot read a negative number of bytes");
 
-	RsyncFetch_t *rf = RsyncFetch_Check(self);
+	RsyncFetch_t *rf = RsyncFetch_Check(self, true);
 	if(!rf)
 		return NULL;
 
@@ -814,15 +867,15 @@ static PyObject *RsyncFetch_readbytes(PyObject *self, PyObject *howmany_obj) {
 	if(!ret)
 		return NULL;
 
-	if(rf_recv_bytes(rf, PyBytes_AsString(ret), howmany) == RF_STATUS_OK)
+	if(rf_status_to_exception(rf, rf_recv_bytes(rf, PyBytes_AsString(ret), howmany)))
 		return ret;
 
 	Py_DecRef(ret);
-	return PyErr_SetFromErrno(PyExc_OSError);
+	return NULL;
 }
 
 static PyObject *RsyncFetch_writebytes(PyObject *self, PyObject *bytes) {
-	RsyncFetch_t *rf = RsyncFetch_Check(self);
+	RsyncFetch_t *rf = RsyncFetch_Check(self, true);
 	if(!rf)
 		return NULL;
 
@@ -833,10 +886,10 @@ static PyObject *RsyncFetch_writebytes(PyObject *self, PyObject *bytes) {
 
 //fprintf(stderr, "%s:%d: len=%zd\n", __FILE__, __LINE__, len);
 
-	if(rf_send_bytes(rf, buf, len) == RF_STATUS_OK)
+	if(rf_status_to_exception(rf, rf_send_bytes(rf, buf, len)))
 		Py_RETURN_NONE;
 
-	return PyErr_SetFromErrno(PyExc_OSError);
+	return NULL;
 }
 
 static PyObject *RsyncFetch_self(PyObject *self, PyObject *args) {
@@ -859,7 +912,7 @@ static PyMethodDef RsyncFetch_methods[] = {
 static PyTypeObject RsyncFetch_type = {
 	PyVarObject_HEAD_INIT(NULL, 0)
 	.tp_flags = Py_TPFLAGS_DEFAULT,
-	.tp_basicsize = sizeof(RsyncFetch_t),
+	.tp_basicsize = sizeof(struct RsyncFetchObject),
 	.tp_name = "rsync_fetch.RsyncFetch",
 	.tp_new = (newfunc)RsyncFetch_new,
 	.tp_dealloc = (destructor)RsyncFetch_dealloc,
