@@ -83,6 +83,10 @@ static const pipestream_t pipestream_0 = PIPESTREAM_INITIALIZER;
 #define RF_STREAM_ERR_BUFSIZE 4096
 #define RF_BUFSIZE_ADJUSTMENT (3 * sizeof(void *))
 
+#define NDX_DONE INT32_C(1)
+#define NDX_FLIST_EOF INT32_C(-2)
+#define NDX_FLIST_OFFSET INT32_C(-101)
+
 enum {
 	RF_STREAM_IN,
 	RF_STREAM_OUT,
@@ -784,7 +788,7 @@ static const uint8_t varint_extra[] = {
 };
 
 __attribute__((unused))
-static rf_status_t recv_varint(RsyncFetch_t *rf, uint32_t *d) {
+static rf_status_t rf_recv_varint(RsyncFetch_t *rf, uint32_t *d) {
 	uint8_t init;
 	RF_PROPAGATE_ERROR(rf_recv_uint8(rf, &init));
 	size_t extra = varint_extra[init >> 2];
@@ -803,7 +807,7 @@ static rf_status_t recv_varint(RsyncFetch_t *rf, uint32_t *d) {
 }
 
 __attribute__((unused))
-static rf_status_t recv_varlong(RsyncFetch_t *rf, uint32_t *d, size_t min_bytes) {
+static rf_status_t rf_recv_varlong(RsyncFetch_t *rf, uint32_t *d, size_t min_bytes) {
 	if(min_bytes > 8)
 		return RF_STATUS_ASSERT;
 	uint8_t init_bytes[9] = {0};
@@ -822,6 +826,78 @@ static rf_status_t recv_varlong(RsyncFetch_t *rf, uint32_t *d, size_t min_bytes)
 		v |= extra_bytes[i] << (8 * i);
 	*d = v;
 	return RF_STATUS_OK;
+}
+
+__attribute__((unused))
+static rf_status_t rf_recv_ndx(RsyncFetch_t *rf, int32_t *d) {
+	int32_t *prev_ptr;
+	bool is_positive;
+	uint8_t init;
+	RF_PROPAGATE_ERROR(rf_recv_uint8(rf, &init));
+	if(init == UINT8_C(0xFF)) {
+		RF_PROPAGATE_ERROR(rf_recv_uint8(rf, &init));
+		prev_ptr = &rf->prev_negative_ndx_in;
+		is_positive = false;
+	} else if(init) {
+		prev_ptr = &rf->prev_positive_ndx_in;
+		is_positive = true;
+	} else {
+		return NDX_DONE;
+	}
+
+	int32_t ndx;
+	if(init == 0xFE) {
+		RF_PROPAGATE_ERROR(rf_recv_uint8(rf, &init));
+		if(init & 0x80) {
+			uint8_t extra_bytes[4];
+			RF_PROPAGATE_ERROR(rf_recv_bytes(rf, (char *)extra_bytes, sizeof extra_bytes - 1));
+			extra_bytes[sizeof extra_bytes - 1] = init & 0x7F;
+			ndx = 0;
+			for(int i = 0; i < sizeof extra_bytes; i++)
+				ndx |= extra_bytes[i] << (8 * i);
+		} else {
+			uint8_t onemorebyte;
+			RF_PROPAGATE_ERROR(rf_recv_uint8(rf, &onemorebyte));
+			ndx = ((init << 8) | onemorebyte) + *prev_ptr;
+		}
+	} else {
+		ndx = init + *prev_ptr;
+	}
+
+	*prev_ptr = ndx;
+	*d = is_positive ? ndx : -ndx;
+	return RF_STATUS_OK;
+}
+
+__attribute__((unused))
+static rf_status_t rf_send_ndx(RsyncFetch_t *rf, int32_t ndx) {
+	int32_t diff;
+	if(ndx >= 0) {
+		diff = ndx - rf->prev_positive_ndx_out;
+		rf->prev_positive_ndx_out = ndx;
+	} else if(ndx == NDX_DONE) {
+		return rf_send_uint8(rf, 0);
+	} else {
+		RF_PROPAGATE_ERROR(rf_send_uint8(rf, UINT8_C(0xFF)));
+		ndx = -ndx;
+		diff = ndx - rf->prev_negative_ndx_out;
+		rf->prev_negative_ndx_out = ndx;
+	}
+
+	if(diff < 0xFE && diff > 0) {
+		return rf_send_uint8(rf, diff);
+	} else {
+		RF_PROPAGATE_ERROR(rf_send_uint8(rf, UINT8_C(0xFE)));
+		if(diff < 0 || diff > 0x7FFFF) {
+			RF_PROPAGATE_ERROR(rf_send_uint8(rf, (ndx >> 24) | UINT8_C(0x80)));
+			RF_PROPAGATE_ERROR(rf_send_uint8(rf, ndx));
+			RF_PROPAGATE_ERROR(rf_send_uint8(rf, ndx >> 8));
+			return rf_send_uint8(rf, ndx >> 16);
+		} else {
+			RF_PROPAGATE_ERROR(rf_send_uint8(rf, diff >> 8));
+			return rf_send_uint8(rf, diff);
+		}
+	}
 }
 
 static bool rf_status_to_exception(RsyncFetch_t *rf, rf_status_t s) {
