@@ -1121,7 +1121,7 @@ static rf_status_t rf_fill_flist_entry(RsyncFetch_t *rf, rf_flist_entry_t *entry
 	if(S_ISLNK(mode)) {
 		int32_t len;
 		RF_PROPAGATE_ERROR(rf_recv_varint(rf, &len));
-		if(len > 1024)
+		if(len + 1 > 65536 - RF_BUFSIZE_ADJUSTMENT)
 			return RF_STATUS_PROTO;
 		char *symlink = malloc(len + 1);
 		if(!symlink)
