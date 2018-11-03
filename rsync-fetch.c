@@ -999,8 +999,8 @@ static rf_status_t rf_recv_vstring(RsyncFetch_t *rf, char **bufp, size_t *lenp) 
 }
 
 static void rf_free_flist_entry(RsyncFetch_t *rf, rf_flist_entry_t *entry) {
-	rf_refstring_free(rf, entry->user);
-	rf_refstring_free(rf, entry->group);
+	rf_refstring_free(rf, &entry->user);
+	rf_refstring_free(rf, &entry->group);
 	free(entry);
 }
 
@@ -1034,10 +1034,10 @@ static rf_status_t rf_fill_flist_entry(RsyncFetch_t *rf, rf_flist_entry_t *entry
 			rf->last_mode = mode;
 			rf->last_mtime = mtime;
 			rf->last_uid = uid;
-			RF_PROPAGATE_ERROR(rf_refstring_free(rf, rf->last_user));
+			RF_PROPAGATE_ERROR(rf_refstring_free(rf, &rf->last_user));
 			RF_PROPAGATE_ERROR(rf_refstring_dup(rf, user));
 			rf->last_user = user;
-			RF_PROPAGATE_ERROR(rf_refstring_free(rf, rf->last_group));
+			RF_PROPAGATE_ERROR(rf_refstring_free(rf, &rf->last_group));
 			RF_PROPAGATE_ERROR(rf_refstring_dup(rf, group));
 			rf->last_group = group;
 
@@ -1057,34 +1057,81 @@ static rf_status_t rf_fill_flist_entry(RsyncFetch_t *rf, rf_flist_entry_t *entry
 		rf->last_mtime = entry->mtime = mtime;
 	}
 
+	int32_t mode;
 	if(xflags & XMIT_SAME_MODE) {
-		entry->mtime = rf->last_mode;
+		mode = entry->mtime = rf->last_mode;
 	} else {
-		int32_t mode;
 		RF_PROPAGATE_ERROR(rf_recv_uint32(rf, &mode));
 		rf->last_mode = entry->mode = mode;
 	}
 
-	int32_t uid;
-	char *user;
 	if(xflags & XMIT_SAME_UID) {
 		entry->uid = rf->last_uid;
-		user = rf->last_user;
+		char *user = rf->last_user;
 		RF_PROPAGATE_ERROR(rf_refstring_dup(rf, user));
 		entry->user = user;
 	} else {
-		RF_PROPAGATE_ERROR(rf_recv_varint(rf, &uid));
+		RF_PROPAGATE_ERROR(rf_recv_varint(rf, &entry->uid));
 		if(xflags & XMIT_USER_NAME_FOLLOWS) {
 			uint8_t len;
 			RF_PROPAGATE_ERROR(rf_recv_uint8(rf, &len));
+			char *user;
 			RF_PROPAGATE_ERROR(rf_refstring_newlen(rf, NULL, len, &user));
 			entry->user = user;
 			RF_PROPAGATE_ERROR(rf_recv_bytes(rf, user, len));
-			RF_PROPAGATE_ERROR(rf_refstring_free(rf, rf->last_user));
+			RF_PROPAGATE_ERROR(rf_refstring_free(rf, &rf->last_user));
 			RF_PROPAGATE_ERROR(rf_refstring_dup(rf, user));
 			rf->last_user = user;
 		}
 	}
+
+	if(xflags & XMIT_SAME_GID) {
+		entry->gid = rf->last_gid;
+		char *group = rf->last_group;
+		RF_PROPAGATE_ERROR(rf_refstring_dup(rf, group));
+		entry->group = group;
+	} else {
+		RF_PROPAGATE_ERROR(rf_recv_varint(rf, &entry->gid));
+		if(xflags & XMIT_USER_NAME_FOLLOWS) {
+			uint8_t len;
+			RF_PROPAGATE_ERROR(rf_recv_uint8(rf, &len));
+			char *group;
+			RF_PROPAGATE_ERROR(rf_refstring_newlen(rf, NULL, len, &group));
+			entry->group = group;
+			RF_PROPAGATE_ERROR(rf_recv_bytes(rf, group, len));
+			RF_PROPAGATE_ERROR(rf_refstring_free(rf, &rf->last_group));
+			RF_PROPAGATE_ERROR(rf_refstring_dup(rf, group));
+			rf->last_group = group;
+		}
+	}
+
+	if(S_ISCHR(mode) || S_ISBLK(mode) || S_ISFIFO(mode) || S_ISSOCK(mode)) {
+		int32_t major;
+		if(xflags & XMIT_SAME_RDEV_MAJOR) {
+			major = flist->major = rf->last_major;
+		} else {
+			RF_PROPAGATE_ERROR(rf_recv_varint(rf, &major));
+			flist->major = rf->last_major = major;
+		}
+		int32_t minor;
+		RF_PROPAGATE_ERROR(rf_recv_varint(rf, &minor));
+		flist->rdev = MAKEDEV(major, minor);
+	}
+
+	if(S_ISLNK(mode)) {
+		int32_t len;
+		RF_PROPAGATE_ERROR(rf_recv_varint(rf, &len));
+		if(len > 1024)
+			return RF_STATUS_PROTO;
+		char *symlink = malloc(len + 1);
+		if(!symlink)
+			return RF_STATUS_ERRNO;
+		symlink[len] = '\0';
+		entry->symlink = symlink;
+		RF_PROPAGATE_ERROR(rf_recv_bytes(rf, symlink, len));
+	}
+
+	return RF_STATUS_OK;
 }
 
 __attribute__((unused))
