@@ -83,6 +83,8 @@ static const pipestream_t pipestream_0 = PIPESTREAM_INITIALIZER;
 #define RF_STREAM_ERR_BUFSIZE 4096
 #define RF_BUFSIZE_ADJUSTMENT (3 * sizeof(void *))
 
+#define MAX_BLOCK_SIZE 131072
+
 #define NDX_DONE INT32_C(1)
 #define NDX_FLIST_EOF INT32_C(-2)
 #define NDX_FLIST_OFFSET INT32_C(-101)
@@ -102,6 +104,21 @@ static const pipestream_t pipestream_0 = PIPESTREAM_INITIALIZER;
 #define XMIT_GROUP_NAME_FOLLOWS (1 << 11)
 #define XMIT_HLINK_FIRST (1 << 12)
 #define XMIT_IO_ERROR_ENDLIST (1 << 12)
+
+#define ITEM_REPORT_CHANGE (1 << 1)
+#define ITEM_REPORT_SIZE (1 << 2)
+#define ITEM_REPORT_TIMEFAIL (1 << 2)
+#define ITEM_REPORT_TIME (1 << 3)
+#define ITEM_REPORT_PERMS (1 << 4)
+#define ITEM_REPORT_OWNER (1 << 5)
+#define ITEM_REPORT_GROUP (1 << 6)
+#define ITEM_REPORT_ACL (1 << 7)
+#define ITEM_REPORT_XATTR (1 << 8)
+#define ITEM_BASIS_TYPE_FOLLOWS (1 << 11)
+#define ITEM_XNAME_FOLLOWS (1 << 12)
+#define ITEM_IS_NEW (1 << 13)
+#define ITEM_LOCAL_CHANGE (1 << 14)
+#define ITEM_TRANSFER (1 << 15)
 
 enum {
 	RF_STREAM_IN,
@@ -153,6 +170,7 @@ typedef struct rf_flist_entry {
 	int32_t gid;
 	int32_t major;
 	int32_t minor;
+	int32_t ndx;
 } rf_flist_entry_t;
 static const rf_flist_entry_t rf_flist_entry_0;
 
@@ -180,6 +198,7 @@ typedef struct RsyncFetch {
 	size_t flists_size;
 	rf_flist_entry_t last;
 	size_t multiplex_remaining;
+	int32_t ndx;
 	int32_t prev_negative_ndx_in;
 	int32_t prev_positive_ndx_in;
 	int32_t prev_negative_ndx_out;
@@ -193,7 +212,7 @@ typedef struct RsyncFetch {
 static const RsyncFetch_t RsyncFetch_0 = {
 	.magic = RSYNCFETCH_MAGIC,
 	.stream = { PIPESTREAM_INITIALIZER, PIPESTREAM_INITIALIZER, PIPESTREAM_INITIALIZER },
-	.multiplex = false,
+	.ndx = 1,
 };
 
 struct RsyncFetchObject {
@@ -346,10 +365,12 @@ static rf_status_t rf_read_error_stream(RsyncFetch_t *rf) {
 	char *buf = stream->buf;
 
 	if(!buf) {
+		size = RF_STREAM_ERR_BUFSIZE - RF_BUFSIZE_ADJUSTMENT;
 		buf = malloc(size);
 		if(!buf)
 			return RF_STATUS_ERRNO;
 		stream->buf = buf;
+		stream->size = size;
 	}
 
 	char *old_buf_end = buf + fill;
@@ -391,10 +412,12 @@ static rf_status_t rf_recv_bytes_raw(RsyncFetch_t *rf, char *dst, size_t len) {
 	char *buf = stream->buf;
 
 	if(!buf) {
+		size = RF_STREAM_IN_BUFSIZE - RF_BUFSIZE_ADJUSTMENT;
 		buf = malloc(size);
 		if(!buf)
 			return RF_STATUS_ERRNO;
 		stream->buf = buf;
+		stream->size = size;
 	}
 
 	if(len > fill) {
@@ -502,7 +525,7 @@ static rf_status_t rf_recv_bytes_raw(RsyncFetch_t *rf, char *dst, size_t len) {
 }
 
 __attribute__((unused))
-static rf_status_t wait_for_eof(RsyncFetch_t *rf) {
+static rf_status_t rf_wait_for_eof(RsyncFetch_t *rf) {
 	for(;;) {
 		if(rf->stream[RF_STREAM_IN].fill)
 			return RF_STATUS_PROTO;
@@ -603,7 +626,9 @@ static rf_status_t rf_send_bytes_raw(RsyncFetch_t *rf, char *src, size_t len) {
 	if(buf) {
 		if(fill + len > size) {
 			size_t newsize = (size + RF_BUFSIZE_ADJUSTMENT) << 1;
-			while(fill + len + RF_BUFSIZE_ADJUSTMENT > newsize)
+			if(newsize < RF_STREAM_OUT_BUFSIZE)
+				newsize = RF_STREAM_OUT_BUFSIZE;
+			while(fill + len > newsize - RF_BUFSIZE_ADJUSTMENT)
 				newsize <<= 1;
 			newsize -= RF_BUFSIZE_ADJUSTMENT;
 			if(offset) {
@@ -630,7 +655,9 @@ static rf_status_t rf_send_bytes_raw(RsyncFetch_t *rf, char *src, size_t len) {
 		}
 	} else {
 		size += RF_BUFSIZE_ADJUSTMENT;
-		while(len + RF_BUFSIZE_ADJUSTMENT > size)
+		if(size < RF_STREAM_OUT_BUFSIZE)
+			size = RF_STREAM_OUT_BUFSIZE;
+		while(len > size - RF_BUFSIZE_ADJUSTMENT)
 			size <<= 1;
 		size -= RF_BUFSIZE_ADJUSTMENT;
 		buf = malloc(size);
@@ -774,7 +801,7 @@ static rf_status_t rf_recv_uint64(RsyncFetch_t *rf, uint64_t *d) {
 	return RF_STATUS_OK;
 }
 
-static const uint8_t varint_extra[] = {
+static const uint8_t rf_varint_extra[] = {
 	0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, // (00 - 3F)/4
 	0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, // (40 - 7F)/4
 	1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, // (80 - BF)/4
@@ -785,7 +812,7 @@ __attribute__((unused))
 static rf_status_t rf_recv_varint(RsyncFetch_t *rf, int32_t *d) {
 	uint8_t init;
 	RF_PROPAGATE_ERROR(rf_recv_uint8(rf, &init));
-	size_t extra = varint_extra[init >> 2];
+	size_t extra = rf_varint_extra[init >> 2];
 	if(extra) {
 		uint8_t extra_bytes[7];
 		RF_PROPAGATE_ERROR(rf_recv_bytes(rf, (char *)extra_bytes, extra));
@@ -806,7 +833,7 @@ static rf_status_t rf_recv_varlong(RsyncFetch_t *rf, size_t min_bytes, int64_t *
 		return RF_STATUS_ASSERT;
 	uint8_t init_bytes[9] = {0};
 	RF_PROPAGATE_ERROR(rf_recv_bytes(rf, (char *)init_bytes, min_bytes));
-	size_t extra = varint_extra[init_bytes[0] >> 2];
+	size_t extra = rf_varint_extra[init_bytes[0] >> 2];
 	uint8_t *extra_bytes = init_bytes + 1;
 	size_t total_bytes = min_bytes + extra;
 	if(extra) {
@@ -895,7 +922,8 @@ static rf_status_t rf_send_ndx(RsyncFetch_t *rf, int32_t ndx) {
 }
 
 __attribute__((unused))
-static rf_status_t rf_recv_vstring(RsyncFetch_t *rf, char **bufp, size_t *lenp) {
+static rf_status_t rf_recv_vstring(RsyncFetch_t *rf, char **bufp) {
+	RF_PROPAGATE_ERROR(rf_refstring_free(rf, bufp));
 	uint8_t b;
 	RF_PROPAGATE_ERROR(rf_recv_uint8(rf, &b));
 	size_t len;
@@ -909,11 +937,10 @@ static rf_status_t rf_recv_vstring(RsyncFetch_t *rf, char **bufp, size_t *lenp) 
 	char *buf;
 	RF_PROPAGATE_ERROR(rf_refstring_newlen(rf, NULL, len, &buf));
 	rf_status_t s = rf_recv_bytes(rf, buf, len);
-	if(s != RF_STATUS_OK)
+	if(s == RF_STATUS_OK)
+		*bufp = buf;
+	else
 		rf_refstring_free(rf, &buf);
-	*bufp = buf;
-	if(lenp)
-		*lenp = len;
 	return s;
 }
 
@@ -971,6 +998,7 @@ static int rf_flist_entry_cmp(const void *ap, const void *bp) {
 	} else {
 		a_basename = a_name;
 		a_dirname_len = 0;
+		a_basename_len = a_namelen;
 	}
 
 	if(b_basename) {
@@ -980,6 +1008,7 @@ static int rf_flist_entry_cmp(const void *ap, const void *bp) {
 	} else {
 		b_basename = b_name;
 		b_dirname_len = 0;
+		b_basename_len = b_namelen;
 	}
 
 	if(a_dirname_len == b_dirname_len && memcmp(a_name, b_name, a_dirname_len) == 0) {
@@ -1016,12 +1045,18 @@ static int rf_flist_entry_cmp(const void *ap, const void *bp) {
 	return memcmp2(a_name, b_name, a_namelen, b_namelen);
 }
 
-__attribute__((unused))
 static rf_status_t rf_flist_new(RsyncFetch_t *rf, int32_t offset, rf_flist_t **flistp) {
 	rf_flist_t *flist = malloc(sizeof *flist);
 	if(!flist)
 		return RF_STATUS_ERRNO;
 	*flist = rf_flist_0;
+	rf_flist_t *tail = rf->flists_tail;
+	if(tail)
+		tail->next = flist;
+	else
+		rf->flists_head = flist;
+	rf->flists_tail = flist;
+	flist->prev = tail;
 	*flistp = flist;
 	return RF_STATUS_OK;
 }
@@ -1031,6 +1066,16 @@ static void rf_flist_free(RsyncFetch_t *rf, rf_flist_t **flistp) {
 	if(flistp) {
 		rf_flist_t *flist = *flistp;
 		if(flist) {
+			rf_flist_t *next = flist->next;
+			rf_flist_t *prev = flist->prev;
+			if(next)
+				next->prev = prev;
+			else
+				rf->flists_tail = prev;
+			if(prev)
+				prev->next = next;
+			else
+				rf->flists_head = next;
 			free(flist->entries);
 			free(flist);
 		}
@@ -1081,7 +1126,7 @@ static rf_flist_entry_t *rf_find_ndx(RsyncFetch_t *rf, int32_t ndx) {
 	return NULL;
 }
 
-static rf_flist_entry_t *rf_flist_sort(RsyncFetch_t *rf, rf_flist_t *flist) {
+static rf_status_t rf_flist_sort(RsyncFetch_t *rf, rf_flist_t *flist) {
 	rf_flist_entry_t **entries = flist->entries;
 	if(entries)
 		qsort(entries, flist->num, sizeof *entries, rf_flist_entry_cmp);
@@ -1126,6 +1171,8 @@ static rf_status_t rf_fill_flist_entry(RsyncFetch_t *rf, rf_flist_entry_t *entry
 		return RF_STATUS_PROTO;
 
 	RF_PROPAGATE_ERROR(rf_refstring_dup(rf, name, &rf->last.name));
+
+	entry->ndx = rf->ndx++;
 
 	rf_flist_entry_t *hardlink;
 	if(xflags & XMIT_HLINKED && !(xflags & XMIT_HLINK_FIRST)) {
@@ -1265,6 +1312,217 @@ static rf_status_t rf_recv_flist_entry(RsyncFetch_t *rf, rf_flist_entry_t **entr
 	return *entryp = entry, RF_STATUS_OK;
 }
 
+__attribute__((unused))
+static rf_status_t rf_recv_flist_do(RsyncFetch_t *rf, rf_flist_t *flist) {
+	for(;;) {
+		rf_flist_entry_t *entry;
+		RF_PROPAGATE_ERROR(rf_recv_flist_entry(rf, &entry));
+		if(!entry)
+			break;
+		RF_PROPAGATE_ERROR(rf_flist_add_entry(rf, flist, entry));
+	}
+	RF_PROPAGATE_ERROR(rf_flist_sort(rf, flist));
+	rf->ndx++;
+	return RF_STATUS_OK;
+}
+
+__attribute__((unused))
+static rf_status_t rf_recv_flist(RsyncFetch_t *rf, rf_flist_t **flistp) {
+	rf_flist_t *flist;
+	RF_PROPAGATE_ERROR(rf_flist_new(rf, rf->ndx, &flist));
+
+	rf_status_t s = rf_recv_flist_do(rf, flist);
+	if(s == RF_STATUS_OK)
+		*flistp = flist;
+	else
+		rf_flist_free(rf, &flist);
+	return s;
+}
+
+static rf_status_t rf_talk(RsyncFetch_t *rf) {
+	uint32_t remote_protocol;
+	RF_PROPAGATE_ERROR(rf_recv_uint32(rf, &remote_protocol));
+	if(remote_protocol < 30)
+		return RF_STATUS_PROTO;
+	RF_PROPAGATE_ERROR(rf_send_uint32(rf, 30));
+
+	uint8_t cflags;
+	RF_PROPAGATE_ERROR(rf_recv_uint8(rf, &cflags));
+
+	uint32_t checksum_seed;
+	RF_PROPAGATE_ERROR(rf_recv_uint32(rf, &checksum_seed));
+
+	rf->multiplex = true;
+
+/*
+	char **exclusions = rf->exclusions;
+	size_t num_exclusions = rf->num_exclusions;
+	for(size_t i = 0; i < num_exclusions; i++) {
+		char *exclusion = exclusions[i];
+		size_t exclusion_len = rf_refstring_len(exclusion);
+		RF_PROPAGATE_ERROR(rf_send_uint32(rf, exclusion_len));
+		RF_PROPAGATE_ERROR(rf_send_bytes(rf, exclusion, exclusion_len));
+	}
+*/
+	RF_PROPAGATE_ERROR(rf_send_uint32(rf, 0));
+
+	rf_flist_t *flist;
+	RF_PROPAGATE_ERROR(rf_recv_flist(rf, &flist));
+	// FIXME: handle flist
+	RF_PROPAGATE_ERROR(rf_send_ndx(rf, NDX_DONE));
+
+	int phase = 0;
+
+	for(;;) {
+		int32_t ndx;
+		RF_PROPAGATE_ERROR(rf_recv_ndx(rf, &ndx));
+		if(ndx == NDX_FLIST_EOF) {
+			// do nothing
+		} else if(ndx == NDX_DONE) {
+			flist = rf->flists_head;
+			rf_flist_free(rf, &flist);
+			if(!rf->flists_head) {
+				phase++;
+				RF_PROPAGATE_ERROR(rf_send_ndx(rf, NDX_DONE));
+			}
+			if(phase > 2)
+				break;
+		} else if(ndx > 0) {
+			// recv_attrs
+			//rf_flist_entry_t *entry = rf_find_ndx(rf, ndx);
+			uint16_t iflags;
+			RF_PROPAGATE_ERROR(rf_recv_uint16(rf, &iflags));
+			uint8_t b;
+			if(iflags & ITEM_BASIS_TYPE_FOLLOWS)
+				RF_PROPAGATE_ERROR(rf_recv_uint8(rf, &b));
+			if(iflags & ITEM_XNAME_FOLLOWS) {
+				char *refname;
+				RF_PROPAGATE_ERROR(rf_recv_vstring(rf, &refname));
+				rf_refstring_free(rf, &refname);
+			}
+
+			// recv_sum_head
+			uint32_t number_of_checksums;
+			RF_PROPAGATE_ERROR(rf_recv_uint32(rf, &number_of_checksums));
+			uint32_t block_length;
+			RF_PROPAGATE_ERROR(rf_recv_uint32(rf, &block_length));
+			uint32_t checksum_length;
+			RF_PROPAGATE_ERROR(rf_recv_uint32(rf, &checksum_length));
+			uint32_t remainder_length;
+			RF_PROPAGATE_ERROR(rf_recv_uint32(rf, &remainder_length));
+
+			if(number_of_checksums)
+				return RF_STATUS_PROTO;
+
+			for(;;) {
+				uint32_t len;
+				RF_PROPAGATE_ERROR(rf_recv_uint32(rf, &len));
+				if(!len)
+					break;
+				if(len > MAX_BLOCK_SIZE)
+					return RF_STATUS_PROTO;
+				char *buf = malloc(len);
+				if(!buf)
+					return RF_STATUS_ERRNO;
+				rf_status_t s = rf_recv_bytes(rf, buf, len);
+				free(buf);
+				if(s != RF_STATUS_OK)
+					return s;
+			}
+
+			char md5[16];
+			RF_PROPAGATE_ERROR(rf_recv_bytes(rf, md5, sizeof md5));
+		} else {
+			// ndx = NDX_FLIST_OFFSET - ndx
+			RF_PROPAGATE_ERROR(rf_recv_flist(rf, &flist));
+			// FIXME: handle flist
+			RF_PROPAGATE_ERROR(rf_send_ndx(rf, NDX_DONE));
+		}
+	}
+
+	// stats follow
+
+	int64_t total_read;
+	RF_PROPAGATE_ERROR(rf_recv_varlong(rf, 3, &total_read));
+	int64_t total_written;
+	RF_PROPAGATE_ERROR(rf_recv_varlong(rf, 3, &total_written));
+	int64_t total_size;
+	RF_PROPAGATE_ERROR(rf_recv_varlong(rf, 3, &total_size));
+	int64_t flist_buildtime;
+	RF_PROPAGATE_ERROR(rf_recv_varlong(rf, 3, &flist_buildtime));
+	int64_t flist_xfertime;
+	RF_PROPAGATE_ERROR(rf_recv_varlong(rf, 3, &flist_xfertime));
+
+	RF_PROPAGATE_ERROR(rf_send_ndx(rf, NDX_DONE));
+
+	return rf_wait_for_eof(rf);
+}
+
+static rf_status_t rf_run(RsyncFetch_t *rf) {
+	int in_pipe[2], out_pipe[2], err_pipe[2];
+	if(create_pipe(in_pipe) != -1) {
+		rf->stream[RF_STREAM_IN].fd = in_pipe[0];
+		if(create_pipe(out_pipe) != -1) {
+			rf->stream[RF_STREAM_OUT].fd = out_pipe[1];
+			if(create_pipe(err_pipe) != -1) {
+				rf->stream[RF_STREAM_ERR].fd = err_pipe[0];
+				int pid = vfork();
+				if(pid == 0) {
+					if(dup2(out_pipe[0], STDIN_FILENO) == -1
+					|| dup2(in_pipe[1], STDOUT_FILENO) == -1
+//					|| dup2(err_pipe[1], STDERR_FILENO) == -1
+					) {
+						perror("dup2");
+						_exit(2);
+					}
+
+					if(fcntl(STDIN_FILENO, F_SETFL, 0) == -1
+					|| fcntl(STDOUT_FILENO, F_SETFL, 0) == -1
+					|| fcntl(STDERR_FILENO, F_SETFL, 0) == -1) {
+						perror("fcntl");
+						_exit(2);
+					}
+
+#ifdef SIGPIPE
+					signal(SIGPIPE, SIG_DFL);
+#endif
+#ifdef SIGXFZ
+					signal(SIGXFZ, SIG_DFL);
+#endif
+#ifdef SIGXFSZ
+					signal(SIGXFSZ, SIG_DFL);
+#endif
+
+					char * const argv[] = { "/usr/bin/rsync", "--server", "--sender", "-lHogDtpre.iLsf", "/etc/network", NULL };
+					execvp(argv[0], argv);
+					perror("execvp");
+					_exit(2);
+				} else if(pid != -1) {
+					rf->pid = pid;
+					if(close(in_pipe[1]) != -1) {
+						in_pipe[1] = -1;
+						if(close(out_pipe[0]) != -1) {
+							out_pipe[0] = -1;
+							if(close(err_pipe[1]) != -1) {
+								err_pipe[1] = -1;
+								return rf_talk(rf);
+							}
+						}
+					}
+				}
+				if(err_pipe[1] != -1)
+					close(err_pipe[1]);
+			}
+			if(out_pipe[0] != -1)
+				close(out_pipe[0]);
+		}
+		if(in_pipe[1] != -1)
+			close(in_pipe[1]);
+	}
+
+	return RF_STATUS_ERRNO;
+}
+
 static bool rf_status_to_exception(RsyncFetch_t *rf, rf_status_t s) {
 	switch(s) {
 		case RF_STATUS_OK:
@@ -1293,92 +1551,10 @@ static bool rf_status_to_exception(RsyncFetch_t *rf, rf_status_t s) {
 }
 
 static PyObject *RsyncFetch_new(PyTypeObject *subtype, PyObject *args, PyObject *kwargs) {
-	int in_pipe[2], out_pipe[2], err_pipe[2];
-	if(create_pipe(in_pipe) == -1) {
-		PyErr_SetFromErrno(PyExc_OSError);
-	} else {
-		if(create_pipe(out_pipe) == -1) {
-			PyErr_SetFromErrno(PyExc_OSError);
-		} else {
-			if(create_pipe(err_pipe) == -1) {
-				PyErr_SetFromErrno(PyExc_OSError);
-			} else {
-				int pid = vfork();
-				if(pid == -1) {
-					PyErr_SetFromErrno(PyExc_OSError);
-				} else if(pid) {
-					if(close(in_pipe[1]) == -1) {
-						PyErr_SetFromErrno(PyExc_OSError);
-					} else {
-						in_pipe[1] = -1;
-						if(close(out_pipe[0]) == -1) {
-							PyErr_SetFromErrno(PyExc_OSError);
-						} else {
-							out_pipe[0] = -1;
-							if(close(err_pipe[1]) == -1) {
-								PyErr_SetFromErrno(PyExc_OSError);
-							} else {
-								err_pipe[1] = -1;
-
-								struct RsyncFetchObject *obj = PyObject_New(struct RsyncFetchObject, subtype);
-								if(obj) {
-									RsyncFetch_t *rf = &obj->rf;
-									*rf = RsyncFetch_0;
-									rf->pid = pid;
-									rf->stream[RF_STREAM_IN].fd = in_pipe[0];
-									rf->stream[RF_STREAM_OUT].fd = out_pipe[1];
-									rf->stream[RF_STREAM_ERR].fd = err_pipe[0];
-									rf->stream[RF_STREAM_IN].size = RF_STREAM_IN_BUFSIZE - RF_BUFSIZE_ADJUSTMENT;
-									rf->stream[RF_STREAM_OUT].size = RF_STREAM_OUT_BUFSIZE - RF_BUFSIZE_ADJUSTMENT;
-									rf->stream[RF_STREAM_ERR].size = RF_STREAM_ERR_BUFSIZE - RF_BUFSIZE_ADJUSTMENT;
-
-									return &obj->ob_base;
-								}
-							}
-						}
-					}
-					while(waitpid(pid, NULL, 0) == -1 && errno == EINTR);
-				} else {
-					if(dup2(out_pipe[0], STDIN_FILENO) == -1
-					|| dup2(in_pipe[1], STDOUT_FILENO) == -1
-					|| dup2(err_pipe[1], STDERR_FILENO) == -1) {
-						perror("dup2");
-						_exit(2);
-					}
-
-					if(fcntl(STDIN_FILENO, F_SETFL, 0) == -1
-					|| fcntl(STDOUT_FILENO, F_SETFL, 0) == -1
-					|| fcntl(STDERR_FILENO, F_SETFL, 0) == -1) {
-						perror("fcntl");
-						_exit(2);
-					}
-
-#ifdef SIGPIPE
-					signal(SIGPIPE, SIG_DFL);
-#endif
-#ifdef SIGXFZ
-					signal(SIGXFZ, SIG_DFL);
-#endif
-#ifdef SIGXFSZ
-					signal(SIGXFSZ, SIG_DFL);
-#endif
-
-					char * const argv[] = { "cat", NULL };
-					execvp(argv[0], argv);
-					perror("execvp");
-					_exit(2);
-				}
-				if(err_pipe[0] != -1)
-					close(err_pipe[0]);
-				close(err_pipe[1]);
-			}
-			close(out_pipe[0]);
-			if(out_pipe[1] != -1)
-				close(out_pipe[1]);
-		}
-		if(in_pipe[0] != -1)
-			close(in_pipe[0]);
-		close(in_pipe[1]);
+	struct RsyncFetchObject *obj = PyObject_New(struct RsyncFetchObject, subtype);
+	if(obj) {
+		obj->rf = RsyncFetch_0;
+		return &obj->ob_base;
 	}
 	return NULL;
 }
@@ -1396,12 +1572,28 @@ static int RsyncFetch_dealloc(PyObject *self) {
 		if(rf->pid)
 			while(waitpid(rf->pid, NULL, 0) == -1 && errno == EINTR);
 		rf_clear_flist_entry(rf, &rf->last);
+		for(rf_flist_t *next, *flist = rf->flists_head; flist; flist = next) {
+			next = flist->next;
+			rf_flist_free(rf, &flist);
+		}
 	}
 
 	freefunc tp_free = Py_TYPE(self)->tp_free ?: PyObject_Free;
 	tp_free(self);
 
 	return 0;
+}
+
+static PyObject *RsyncFetch_run(PyObject *self, PyObject *args) {
+	RsyncFetch_t *rf = RsyncFetch_Check(self, true);
+	if(!rf)
+		return NULL;
+	rf->closed = true;
+
+	if(rf_status_to_exception(rf, rf_run(rf)))
+		Py_RETURN_NONE;
+	else
+		return NULL;
 }
 
 static PyObject *RsyncFetch_readbytes(PyObject *self, PyObject *howmany_obj) {
@@ -1457,6 +1649,7 @@ static PyObject *RsyncFetch_none(PyObject *self, PyObject *args) {
 static PyMethodDef RsyncFetch_methods[] = {
 	{"__enter__", (PyCFunction)RsyncFetch_self, METH_NOARGS, "return a context manager for 'with'"},
 	{"__exit__", RsyncFetch_none, METH_VARARGS, "callback for 'with' context manager"},
+	{"run", RsyncFetch_run, METH_VARARGS, "perform the rsync action"},
 	{"readbytes", RsyncFetch_readbytes, METH_O, "read some bytes"},
 	{"writebytes", RsyncFetch_writebytes, METH_O, "write some bytes"},
 	{NULL}
