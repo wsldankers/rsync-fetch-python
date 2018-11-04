@@ -157,10 +157,12 @@ typedef struct rf_flist_entry {
 static const rf_flist_entry_t rf_flist_entry_0;
 
 typedef struct rf_flist {
+	struct rf_flist *prev;
+	struct rf_flist *next;
 	size_t size;
 	size_t num;
 	size_t offset;
-	rf_flist_entry_t *entries;
+	rf_flist_entry_t **entries;
 } rf_flist_t;
 static const rf_flist_t rf_flist_0;
 
@@ -172,6 +174,10 @@ typedef struct RsyncFetch {
 	uint64_t magic;
 	pipestream_t stream[3];
 	rf_flist_t *flist;
+	rf_flist_t *flists_head;
+	rf_flist_t *flists_tail;
+	size_t flists_num;
+	size_t flists_size;
 	rf_flist_entry_t last;
 	size_t multiplex_remaining;
 	int32_t prev_negative_ndx_in;
@@ -219,7 +225,7 @@ struct refstring_header {
 	size_t refcount;
 };
 
-static inline size_t rf_refstring_len(RsyncFetch_t *rf, const char *str) {
+static inline size_t rf_refstring_len(const char *str) {
 	return str ? ((struct refstring_header *)str)[-1].len : 0;
 }
 
@@ -911,14 +917,6 @@ static rf_status_t rf_recv_vstring(RsyncFetch_t *rf, char **bufp, size_t *lenp) 
 	return s;
 }
 
-static rf_flist_entry_t *rf_find_ndx(RsyncFetch_t *rf, int32_t ndx) {
-	return NULL;
-}
-
-static rf_flist_entry_t *rf_flist_get_entry(RsyncFetch_t *rf, rf_flist_t *flist, int32_t ndx) {
-	return NULL;
-}
-
 static void rf_clear_flist_entry(RsyncFetch_t *rf, rf_flist_entry_t *entry) {
 	rf_refstring_free(rf, &entry->name);
 	rf_refstring_free(rf, &entry->user);
@@ -930,6 +928,166 @@ static void rf_free_flist_entry(RsyncFetch_t *rf, rf_flist_entry_t *entry) {
 	free(entry);
 }
 
+static int memcmp2(const void *a_buf, const void *b_buf, size_t a_len, size_t b_len) {
+	if(a_len < b_len) {
+		int c = memcmp(a_buf, b_buf, a_len);
+		if(c == 0)
+			return -1;
+		else
+			return c;
+	} else {
+		int c = memcmp(a_buf, b_buf, b_len);
+		if(c == 0)
+			return a_len != b_len;
+		else
+			return c;
+	}
+
+}
+
+static int rf_flist_entry_cmp(const void *ap, const void *bp) {
+	const rf_flist_entry_t *a = *(const rf_flist_entry_t **)ap;
+	const rf_flist_entry_t *b = *(const rf_flist_entry_t **)bp;
+
+	bool a_isdir = S_ISDIR(a->mode);
+	bool b_isdir = S_ISDIR(b->mode);
+
+	char *a_name = a->name;
+	char *b_name = b->name;
+
+	size_t a_namelen = rf_refstring_len(a_name);
+	size_t b_namelen = rf_refstring_len(b_name);
+
+	char *a_basename = memrchr(a_name, '/', a_namelen);
+	char *b_basename = memrchr(b_name, '/', b_namelen);
+
+	size_t a_basename_len, b_basename_len;
+	size_t a_dirname_len, b_dirname_len;
+
+	if(a_basename) {
+		a_basename++;
+		a_dirname_len = a_basename - a_name;
+		a_basename_len = a_namelen - a_dirname_len;
+	} else {
+		a_basename = a_name;
+		a_dirname_len = 0;
+	}
+
+	if(b_basename) {
+		b_basename++;
+		b_dirname_len = b_basename - b_name;
+		b_basename_len = b_namelen - b_dirname_len;
+	} else {
+		b_basename = b_name;
+		b_dirname_len = 0;
+	}
+
+	if(a_dirname_len == b_dirname_len && memcmp(a_name, b_name, a_dirname_len) == 0) {
+		if(a_isdir) {
+			if(b_isdir) {
+				if(a_basename_len == 1 && a_basename[0] == '.'
+				&& !(b_basename_len == 1 && b_basename[0] == '.'))
+					return -1;
+			} else {
+				if(a_basename_len == 1 && a_basename[0] == '.')
+					return -1;
+				else
+					return 1;
+			}
+		} else {
+			if(b_basename_len == 1 && b_basename[0] == '.')
+				return 1;
+			else
+				return -1;
+		}
+		return memcmp2(a_basename, b_basename, a_basename_len, b_basename_len);
+	}
+
+	// if b is an ancestor of a
+	if((!a_isdir || (a_basename_len == 1 && a_basename[0] == '.'))
+	&& (b_dirname_len >= a_dirname_len && memcmp(a_name, b_name, a_dirname_len) == 0))
+		return -1;
+
+	// if a is an ancestor of b
+	if((!b_isdir || (b_basename_len == 1 && b_basename[0] == '.'))
+	&& (a_dirname_len >= b_dirname_len && memcmp(b_name, a_name, b_dirname_len) == 0))
+		return 1;
+
+	return memcmp2(a_name, b_name, a_namelen, b_namelen);
+}
+
+__attribute__((unused))
+static rf_status_t rf_flist_new(RsyncFetch_t *rf, int32_t offset, rf_flist_t **flistp) {
+	rf_flist_t *flist = malloc(sizeof *flist);
+	if(!flist)
+		return RF_STATUS_ERRNO;
+	*flist = rf_flist_0;
+	*flistp = flist;
+	return RF_STATUS_OK;
+}
+
+__attribute__((unused))
+static void rf_flist_free(RsyncFetch_t *rf, rf_flist_t **flistp) {
+	if(flistp) {
+		rf_flist_t *flist = *flistp;
+		if(flist) {
+			free(flist->entries);
+			free(flist);
+		}
+		*flistp = NULL;
+	}
+}
+
+__attribute__((unused))
+static rf_status_t rf_flist_add_entry(RsyncFetch_t *rf, rf_flist_t *flist, rf_flist_entry_t *entry) {
+	size_t num = flist->num;
+	size_t size = flist->size;
+	rf_flist_entry_t **entries = flist->entries;
+	if(num == size) {
+		size += RF_BUFSIZE_ADJUSTMENT / sizeof *entries;
+		if(size < 16)
+			size = 16;
+		while(size < (RF_BUFSIZE_ADJUSTMENT / sizeof *entries) || size - (RF_BUFSIZE_ADJUSTMENT / sizeof *entries) <= num)
+			size <<= 1;
+		size -= RF_BUFSIZE_ADJUSTMENT / sizeof *entries;
+		entries = realloc(entries, size * sizeof *entries);
+		if(!entries)
+			return RF_STATUS_ERRNO;
+		flist->entries = entries;
+		flist->size = size;
+	}
+	entries[num] = entry;
+	flist->num = num + 1;
+	
+	return RF_STATUS_OK;
+}
+
+static rf_flist_entry_t *rf_flist_get_entry(RsyncFetch_t *rf, rf_flist_t *flist, int32_t ndx) {
+	size_t offset = flist->offset;
+	if(ndx >= offset) {
+		ndx -= offset;
+		size_t size = flist->size;
+		if(ndx < size)
+			return flist->entries[ndx];
+	}
+	return NULL;
+}
+
+static rf_flist_entry_t *rf_find_ndx(RsyncFetch_t *rf, int32_t ndx) {
+	for(rf_flist_t *flist = rf->flists_tail; flist; flist = flist->prev)
+		if(ndx >= flist->offset)
+			return rf_flist_get_entry(rf, flist, ndx);
+
+	return NULL;
+}
+
+static rf_flist_entry_t *rf_flist_sort(RsyncFetch_t *rf, rf_flist_t *flist) {
+	rf_flist_entry_t **entries = flist->entries;
+	if(entries)
+		qsort(entries, flist->num, sizeof *entries, rf_flist_entry_cmp);
+	return RF_STATUS_OK;
+}
+
 static rf_status_t rf_fill_flist_entry(RsyncFetch_t *rf, rf_flist_entry_t *entry, uint16_t xflags) {
 	uint8_t b;
 	char *last_name = rf->last.name;
@@ -937,7 +1095,7 @@ static rf_status_t rf_fill_flist_entry(RsyncFetch_t *rf, rf_flist_entry_t *entry
 	if(xflags & XMIT_SAME_NAME) {
 		RF_PROPAGATE_ERROR(rf_recv_uint8(rf, &b));
 		len1 = b;
-		if(len1 > rf_refstring_len(rf, last_name))
+		if(len1 > rf_refstring_len(last_name))
 			return RF_STATUS_PROTO;
 	} else {
 		len1 = 0;
@@ -1106,7 +1264,6 @@ static rf_status_t rf_recv_flist_entry(RsyncFetch_t *rf, rf_flist_entry_t **entr
 
 	return *entryp = entry, RF_STATUS_OK;
 }
-
 
 static bool rf_status_to_exception(RsyncFetch_t *rf, rf_status_t s) {
 	switch(s) {
