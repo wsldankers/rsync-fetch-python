@@ -84,6 +84,7 @@ static const pipestream_t pipestream_0 = PIPESTREAM_INITIALIZER;
 #define RF_BUFSIZE_ADJUSTMENT (3 * sizeof(void *))
 
 #define MAX_BLOCK_SIZE 131072
+#define MPLEX_BASE 7
 
 #define NDX_DONE INT32_C(1)
 #define NDX_FLIST_EOF INT32_C(-2)
@@ -332,6 +333,8 @@ static rf_status_t rf_write_out_stream(RsyncFetch_t *rf) {
 
 	ssize_t r;
 	if(offset + fill > size) {
+fprintf(stderr, "%s:%d: rf_write_out_stream(offset=%zu fill=%zu size=%zu)\n", __FILE__, __LINE__, offset, fill, size);
+
 		size_t amount = size - offset;
 		struct iovec iov[2] = {
 			{ buf + offset, amount },
@@ -593,7 +596,7 @@ static rf_status_t rf_recv_bytes(RsyncFetch_t *rf, char *buf, size_t len) {
 			uint8_t mplex[4];
 			RF_PROPAGATE_ERROR(rf_recv_bytes_raw(rf, (char *)mplex, sizeof mplex));
 			multiplex_remaining = mplex[0] | mplex[1] << 8 | mplex[2] << 16;
-			uint8_t channel = mplex[3];
+			int channel = (int)mplex[3] - MPLEX_BASE;
 
 			if(channel == MSG_DATA)
 				break;
@@ -607,6 +610,8 @@ static rf_status_t rf_recv_bytes(RsyncFetch_t *rf, char *buf, size_t len) {
 					free(message);
 					return e;
 				}
+fprintf(stderr, "<%d> ", channel);
+fwrite(message, sizeof *message, multiplex_remaining, stderr);
 				// FIXME: handle message
 				free(message);
 			} else {
@@ -664,13 +669,17 @@ static rf_status_t rf_send_bytes_raw(RsyncFetch_t *rf, char *src, size_t len) {
 		if(!buf)
 			return RF_STATUS_ERRNO;
 		stream->buf = buf;
+		stream->size = size;
 	}
 
 	size_t start = offset + fill;
 	if(start > size)
 		start -= size;
 
-	if(start + len > size) {
+	if(len == 1) {
+fprintf(stderr, "%s:%d: rf_send_bytes_raw(byte=%u)\n", __FILE__, __LINE__, *(uint8_t *)src);
+		buf[start] = *src;
+	} if(start + len > size) {
 		size_t amount = size - start;
 		memcpy(buf + start, src, amount);
 		memcpy(buf, src + amount, len - amount);
@@ -680,15 +689,17 @@ static rf_status_t rf_send_bytes_raw(RsyncFetch_t *rf, char *src, size_t len) {
 
 	stream->fill = fill + len;
 
+fprintf(stderr, "%s:%d: rf_send_bytes_raw(len=%zu fill=%zu)\n", __FILE__, __LINE__, len, fill + len);
 	return RF_STATUS_OK;
 }
 
 static rf_status_t rf_send_bytes(RsyncFetch_t *rf, char *buf, size_t len) {
 	if(!rf->multiplex)
 		return rf_send_bytes_raw(rf, buf, len);
+//fprintf(stderr, "%s:%d: rf_send_bytes(len=%zu)\n", __FILE__, __LINE__, len);
 	while(len) {
 		size_t chunk = len < 0xFFFFFF ? len : 0xFFFFFF;
-		uint8_t mplex[4] = { chunk, chunk >> 8, chunk >> 16, MSG_DATA };
+		uint8_t mplex[4] = { chunk, chunk >> 8, chunk >> 16, MSG_DATA + MPLEX_BASE };
 		RF_PROPAGATE_ERROR(rf_send_bytes_raw(rf, (char *)mplex, sizeof mplex));
 		RF_PROPAGATE_ERROR(rf_send_bytes_raw(rf, buf, chunk));
 		len -= chunk;
@@ -892,12 +903,13 @@ static rf_status_t rf_recv_ndx(RsyncFetch_t *rf, int32_t *d) {
 
 __attribute__((unused))
 static rf_status_t rf_send_ndx(RsyncFetch_t *rf, int32_t ndx) {
+fprintf(stderr, "%s:%d: rf_send_ndx(%d)\n", __FILE__, __LINE__, ndx);
 	int32_t diff;
-	if(ndx >= 0) {
+	if(ndx == NDX_DONE) {
+		return rf_send_uint8(rf, 0);
+	} else if(ndx >= 0) {
 		diff = ndx - rf->prev_positive_ndx_out;
 		rf->prev_positive_ndx_out = ndx;
-	} else if(ndx == NDX_DONE) {
-		return rf_send_uint8(rf, 0);
 	} else {
 		RF_PROPAGATE_ERROR(rf_send_uint8(rf, UINT8_C(0xFF)));
 		ndx = -ndx;
@@ -1046,6 +1058,7 @@ static int rf_flist_entry_cmp(const void *ap, const void *bp) {
 }
 
 static rf_status_t rf_flist_new(RsyncFetch_t *rf, int32_t offset, rf_flist_t **flistp) {
+fprintf(stderr, "%s:%d: rf_flist_new()\n", __FILE__, __LINE__);
 	rf_flist_t *flist = malloc(sizeof *flist);
 	if(!flist)
 		return RF_STATUS_ERRNO;
@@ -1064,6 +1077,7 @@ static rf_status_t rf_flist_new(RsyncFetch_t *rf, int32_t offset, rf_flist_t **f
 __attribute__((unused))
 static void rf_flist_free(RsyncFetch_t *rf, rf_flist_t **flistp) {
 	if(flistp) {
+fprintf(stderr, "%s:%d: rf_flist_free()\n", __FILE__, __LINE__);
 		rf_flist_t *flist = *flistp;
 		if(flist) {
 			rf_flist_t *next = flist->next;
@@ -1080,6 +1094,8 @@ static void rf_flist_free(RsyncFetch_t *rf, rf_flist_t **flistp) {
 			free(flist);
 		}
 		*flistp = NULL;
+	} else {
+fprintf(stderr, "%s:%d: rf_flist_free(NULL)\n", __FILE__, __LINE__);
 	}
 }
 
@@ -1314,6 +1330,7 @@ static rf_status_t rf_recv_flist_entry(RsyncFetch_t *rf, rf_flist_entry_t **entr
 
 __attribute__((unused))
 static rf_status_t rf_recv_flist_do(RsyncFetch_t *rf, rf_flist_t *flist) {
+	rf->flist = flist;
 	for(;;) {
 		rf_flist_entry_t *entry;
 		RF_PROPAGATE_ERROR(rf_recv_flist_entry(rf, &entry));
@@ -1380,14 +1397,17 @@ static rf_status_t rf_talk(RsyncFetch_t *rf) {
 			// do nothing
 		} else if(ndx == NDX_DONE) {
 			flist = rf->flists_head;
+fprintf(stderr, "%s:%d: NDX_DONE flist=%s\n", __FILE__, __LINE__, flist ? "set" : "null");
 			rf_flist_free(rf, &flist);
 			if(!rf->flists_head) {
 				phase++;
+fprintf(stderr, "%s:%d: phase=%d\n", __FILE__, __LINE__, phase);
 				RF_PROPAGATE_ERROR(rf_send_ndx(rf, NDX_DONE));
 			}
 			if(phase > 2)
 				break;
 		} else if(ndx > 0) {
+fprintf(stderr, "%s:%d: recv_attrs\n", __FILE__, __LINE__);
 			// recv_attrs
 			//rf_flist_entry_t *entry = rf_find_ndx(rf, ndx);
 			uint16_t iflags;
@@ -1493,7 +1513,7 @@ static rf_status_t rf_run(RsyncFetch_t *rf) {
 					signal(SIGXFSZ, SIG_DFL);
 #endif
 
-					char * const argv[] = { "/usr/bin/rsync", "--server", "--sender", "-lHogDtpre.iLsf", "/etc/network", NULL };
+					char * const argv[] = { "/tmp/rsync", "--server", "--sender", "-lHogDtpre.iLsf", "/etc/network", NULL };
 					execvp(argv[0], argv);
 					perror("execvp");
 					_exit(2);
@@ -1536,7 +1556,7 @@ static bool rf_status_to_exception(RsyncFetch_t *rf, rf_status_t s) {
 			return PyErr_Format(PyExc_RuntimeError, "operation timed out");
 			break;
 		case RF_STATUS_HANGUP:
-			return PyErr_Format(PyExc_RuntimeError, "process exited prematurely");
+			return PyErr_Format(PyExc_RuntimeError, "rsync process exited prematurely");
 			break;
 		case RF_STATUS_PROTO:
 			return PyErr_Format(PyExc_RuntimeError, "protocol error");
@@ -1685,4 +1705,3 @@ PyMODINIT_FUNC PyInit_rsync_fetch(void) {
 	}
 	return NULL;
 }
-
