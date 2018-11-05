@@ -759,12 +759,20 @@ static rf_status_t rf_send_bytes(RsyncFetch_t *rf, char *buf, size_t len) {
 			len -= 0xFFFFFF;
 			buf += 0xFFFFFF;
 		}
+
+		multiplex_out_remaining = 0;
 	}		
 
-	uint8_t mplex[4] = { 0, 0, 0, MSG_DATA + MPLEX_BASE };
-	RF_PROPAGATE_ERROR(rf_send_bytes_raw(rf, (char *)mplex, sizeof mplex));
+	if(!len)
+		return RF_STATUS_OK;
+
+	if(!multiplex_out_remaining) {
+		uint8_t mplex[4] = { 0, 0, 0, MSG_DATA + MPLEX_BASE };
+		RF_PROPAGATE_ERROR(rf_send_bytes_raw(rf, (char *)mplex, sizeof mplex));
+	}
+
 	RF_PROPAGATE_ERROR(rf_send_bytes_raw(rf, buf, len));
-	rf->multiplex_out_remaining = len;
+	rf->multiplex_out_remaining = multiplex_out_remaining + len;
 
 	return RF_STATUS_OK;
 }
