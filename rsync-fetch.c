@@ -20,12 +20,6 @@
 #include "Python.h"
 #include "pythread.h"
 
-#ifdef WITH_THREAD
-#define DECLARE_THREAD_SAVE PyThreadState *_save;
-#else
-#define DECLARE_THREAD_SAVE
-#endif
-
 #define orz(x) (sizeof (x) / sizeof *(x))
 
 #ifdef WORDS_BIGENDIAN
@@ -169,6 +163,7 @@ typedef struct rf_flist_entry {
 	char *group;
 	char *symlink;
 	char *hardlink;
+	PyObject *data_callback;
 	int64_t size;
 	int64_t mtime;
 	int32_t mode;
@@ -196,10 +191,15 @@ static const rf_flist_t rf_flist_0;
 
 typedef struct RsyncFetch {
 	uint64_t magic;
-	pipestream_t stream[3];
+#ifdef WITH_THREAD
+	PyThreadState *py_thread_state;
+#endif
+	PyObject *entry_callback;
+	PyObject *error_callback;
 	rf_flist_t *flist;
 	rf_flist_t *flists_head;
 	rf_flist_t *flists_tail;
+	pipestream_t stream[3];
 	size_t flists_num;
 	size_t flists_size;
 	rf_flist_entry_t last;
@@ -249,6 +249,32 @@ static inline RsyncFetch_t *RsyncFetch_Check(PyObject *v, bool check_failed) {
 		return NULL;
 	}
 }
+
+#ifdef WITH_THREAD
+
+static inline bool rf_unblock_threads(RsyncFetch_t *rf) {
+	if(rf->py_thread_state)
+		return false;
+	rf->py_thread_state = PyEval_SaveThread();
+	return true;
+}
+
+static inline bool rf_block_threads(RsyncFetch_t *rf) {
+	PyThreadState *py_thread_state = rf->py_thread_state;
+	if(py_thread_state) {
+		rf->py_thread_state = NULL;
+		PyEval_RestoreThread(py_thread_state);
+		return true;
+	}
+	return false;
+}
+
+#else
+
+static void rf_block_threads(RsyncFetch_t *rf) {}
+static void rf_unblock_threads(RsyncFetch_t *rf) {}
+
+#endif
 
 struct refstring_header {
 	size_t len;
@@ -434,11 +460,23 @@ static rf_status_t rf_read_error_stream(RsyncFetch_t *rf) {
 	char *new_buf_end = old_buf_end + r;
 	char *todo = buf;
 	for(char *eol = memchr(old_buf_end, '\n', r); eol++; eol = memchr(eol, '\n', new_buf_end - eol)) {
-		// FIXME: handle through callback
-		if(write(STDERR_FILENO, todo, eol - todo) == -1) {
-			stream->fill = 0;
-			return RF_STATUS_ERRNO;
+		PyObject *error_callback = rf->error_callback;
+		if(error_callback) {
+			rf_block_threads(rf);
+			PyObject *args = Py_BuildValue("(y#)",
+				todo, (Py_ssize_t)(eol - todo));
+			if(!args)
+				return RF_STATUS_PYTHON;
+			PyObject *result = PyObject_CallObject(error_callback, args);
+			Py_DecRef(args);
+			if(!result)
+				return RF_STATUS_PYTHON;
+			Py_DecRef(result);
+		} else {
+			if(write(STDERR_FILENO, todo, eol - todo) == -1)
+				return RF_STATUS_ERRNO;
 		}
+
 		todo = eol;
 	}
 
@@ -449,10 +487,24 @@ static rf_status_t rf_read_error_stream(RsyncFetch_t *rf) {
 		stream->fill = fill;
 	} else if(fill + r == size) {
 		stream->fill = 0;
-		// FIXME: handle through callback
-		if(write(STDERR_FILENO, buf, size) == -1)
-			return RF_STATUS_ERRNO;
+		PyObject *error_callback = rf->error_callback;
+		if(error_callback) {
+			rf_block_threads(rf);
+			PyObject *args = Py_BuildValue("(y#)", buf, size);
+			if(!args)
+				return RF_STATUS_PYTHON;
+			PyObject *result = PyObject_CallObject(error_callback, args);
+			Py_DecRef(args);
+			if(!result)
+				return RF_STATUS_PYTHON;
+			Py_DecRef(result);
+		} else {
+			if(write(STDERR_FILENO, buf, size) == -1)
+				return RF_STATUS_ERRNO;
+		}
 	}
+
+	rf_unblock_threads(rf);
 
 	return RF_STATUS_OK;
 }
@@ -650,21 +702,76 @@ static rf_status_t rf_recv_bytes(RsyncFetch_t *rf, char *buf, size_t len) {
 			if(channel == MSG_DATA)
 				break;
 
-			if(multiplex_in_remaining) {
-				char *message = malloc(multiplex_in_remaining);
-				if(!message)
-					return false;
-				rf_status_t e = rf_recv_bytes_raw(rf, message, multiplex_in_remaining);
-				if(e != RF_STATUS_OK) {
-					free(message);
-					return e;
-				}
-fprintf(stderr, "<%d> ", channel);
-fwrite(message, sizeof *message, multiplex_in_remaining, stderr);
-				// FIXME: handle message
-				free(message);
-			} else {
-				// FIXME: handle empty message
+			switch(channel) {
+				case MSG_ERROR_XFER:
+				case MSG_INFO:
+				case MSG_ERROR:
+				case MSG_WARNING:
+				case MSG_LOG:
+				case MSG_DELETED:
+					if(multiplex_in_remaining) {
+						char *message = malloc(multiplex_in_remaining);
+						if(!message)
+							return RF_STATUS_ERRNO;
+						rf_status_t e = rf_recv_bytes_raw(rf, message, multiplex_in_remaining);
+						if(e != RF_STATUS_OK) {
+							free(message);
+							return e;
+						}
+
+						PyObject *error_callback = rf->error_callback;
+						if(error_callback) {
+							bool was_unblocked = rf_block_threads(rf);
+							PyObject *args = Py_BuildValue("y#i",
+								message, multiplex_in_remaining, channel);
+							free(message);
+							if(!args)
+								return RF_STATUS_PYTHON;
+							PyObject *result = PyObject_CallObject(error_callback, args);
+							Py_DecRef(args);
+							if(!result)
+								return RF_STATUS_PYTHON;
+							Py_DecRef(result);
+							if(was_unblocked)
+								rf_unblock_threads(rf);
+						} else {
+//							fprintf(stderr, "<%d> ", channel);
+							fwrite(message, sizeof *message, multiplex_in_remaining, stderr);
+							free(message);
+						}
+					}
+					break;
+				case MSG_IO_ERROR:
+				case MSG_SUCCESS:
+				case MSG_NO_SEND:;
+					int32_t err;
+					if(multiplex_in_remaining != sizeof err)
+						return RF_STATUS_PROTO;
+					RF_PROPAGATE_ERROR(rf_recv_bytes_raw(rf, (char *)&err, sizeof err));
+
+					PyObject *error_callback = rf->error_callback;
+					if(error_callback) {
+						bool was_unblocked = rf_block_threads(rf);
+						PyObject *args = Py_BuildValue("li", (long)le32(err), channel);
+						if(!args)
+							return RF_STATUS_PYTHON;
+						PyObject *result = PyObject_CallObject(error_callback, args);
+						Py_DecRef(args);
+						if(!result)
+							return RF_STATUS_PYTHON;
+						Py_DecRef(result);
+						if(was_unblocked)
+							rf_unblock_threads(rf);
+//					} else {
+//						fprintf(stderr, "<%d> %ld\n", channel, (long)le32(err));
+					}
+					break;
+				case MSG_NOOP:
+					if(multiplex_in_remaining)
+						return RF_STATUS_PROTO;
+					break;
+				default:
+					return RF_STATUS_PROTO;
 			}
 		}
 	}
@@ -781,80 +888,80 @@ static rf_status_t rf_send_bytes(RsyncFetch_t *rf, char *buf, size_t len) {
 }
 
 __attribute__((unused))
-static rf_status_t rf_send_int8(RsyncFetch_t *rf, int8_t d) {
+static inline rf_status_t rf_send_int8(RsyncFetch_t *rf, int8_t d) {
 	return rf_send_bytes(rf, (char *)&d, sizeof d);
 }
 
-static rf_status_t rf_send_uint8(RsyncFetch_t *rf, uint8_t d) {
+static inline rf_status_t rf_send_uint8(RsyncFetch_t *rf, uint8_t d) {
 	return rf_send_bytes(rf, (char *)&d, sizeof d);
 }
 
 __attribute__((unused))
-static rf_status_t rf_send_int16(RsyncFetch_t *rf, int16_t d) {
+static inline rf_status_t rf_send_int16(RsyncFetch_t *rf, int16_t d) {
 	int16_t le = le16(d);
 	return rf_send_bytes(rf, (char *)&le, sizeof le);
 }
 
-static rf_status_t rf_send_uint16(RsyncFetch_t *rf, uint16_t d) {
+static inline rf_status_t rf_send_uint16(RsyncFetch_t *rf, uint16_t d) {
 	uint16_t le = le16(d);
 	return rf_send_bytes(rf, (char *)&le, sizeof le);
 }
 
 __attribute__((unused))
-static rf_status_t rf_send_int32(RsyncFetch_t *rf, int32_t d) {
+static inline rf_status_t rf_send_int32(RsyncFetch_t *rf, int32_t d) {
 	int32_t le = le32(d);
 	return rf_send_bytes(rf, (char *)&le, sizeof le);
 }
 
-static rf_status_t rf_send_uint32(RsyncFetch_t *rf, uint32_t d) {
+static inline rf_status_t rf_send_uint32(RsyncFetch_t *rf, uint32_t d) {
 	uint32_t le = le32(d);
 	return rf_send_bytes(rf, (char *)&le, sizeof le);
 }
 
 __attribute__((unused))
-static rf_status_t rf_send_int64(RsyncFetch_t *rf, int64_t d) {
+static inline rf_status_t rf_send_int64(RsyncFetch_t *rf, int64_t d) {
 	int64_t le = le64(d);
 	return rf_send_bytes(rf, (char *)&le, sizeof le);
 }
 
 __attribute__((unused))
-static rf_status_t rf_send_uint64(RsyncFetch_t *rf, uint64_t d) {
+static inline rf_status_t rf_send_uint64(RsyncFetch_t *rf, uint64_t d) {
 	uint64_t le = le64(d);
 	return rf_send_bytes(rf, (char *)&le, sizeof le);
 }
 
 __attribute__((unused))
-static rf_status_t rf_recv_int8(RsyncFetch_t *rf, int8_t *d) {
+static inline rf_status_t rf_recv_int8(RsyncFetch_t *rf, int8_t *d) {
 	return rf_recv_bytes(rf, (char *)d, sizeof *d);
 }
 
-static rf_status_t rf_recv_uint8(RsyncFetch_t *rf, uint8_t *d) {
+static inline rf_status_t rf_recv_uint8(RsyncFetch_t *rf, uint8_t *d) {
 	return rf_recv_bytes(rf, (char *)d, sizeof *d);
 }
 
 __attribute__((unused))
-static rf_status_t rf_recv_int16(RsyncFetch_t *rf, int16_t *d) {
+static inline rf_status_t rf_recv_int16(RsyncFetch_t *rf, int16_t *d) {
 	int16_t le;
 	RF_PROPAGATE_ERROR(rf_recv_bytes(rf, (char *)&le, sizeof le));
 	*d = le16(le);
 	return RF_STATUS_OK;
 }
 
-static rf_status_t rf_recv_uint16(RsyncFetch_t *rf, uint16_t *d) {
+static inline rf_status_t rf_recv_uint16(RsyncFetch_t *rf, uint16_t *d) {
 	uint16_t le;
 	RF_PROPAGATE_ERROR(rf_recv_bytes(rf, (char *)&le, sizeof le));
 	*d = le16(le);
 	return RF_STATUS_OK;
 }
 
-static rf_status_t rf_recv_int32(RsyncFetch_t *rf, int32_t *d) {
+static inline rf_status_t rf_recv_int32(RsyncFetch_t *rf, int32_t *d) {
 	int32_t le;
 	RF_PROPAGATE_ERROR(rf_recv_bytes(rf, (char *)&le, sizeof le));
 	*d = le32(le);
 	return RF_STATUS_OK;
 }
 
-static rf_status_t rf_recv_uint32(RsyncFetch_t *rf, uint32_t *d) {
+static inline rf_status_t rf_recv_uint32(RsyncFetch_t *rf, uint32_t *d) {
 	uint32_t le;
 	RF_PROPAGATE_ERROR(rf_recv_bytes(rf, (char *)&le, sizeof le));
 	*d = le32(le);
@@ -862,7 +969,7 @@ static rf_status_t rf_recv_uint32(RsyncFetch_t *rf, uint32_t *d) {
 }
 
 __attribute__((unused))
-static rf_status_t rf_recv_int64(RsyncFetch_t *rf, int64_t *d) {
+static inline rf_status_t rf_recv_int64(RsyncFetch_t *rf, int64_t *d) {
 	int64_t le;
 	RF_PROPAGATE_ERROR(rf_recv_bytes(rf, (char *)&le, sizeof le));
 	*d = le64(le);
@@ -870,7 +977,7 @@ static rf_status_t rf_recv_int64(RsyncFetch_t *rf, int64_t *d) {
 }
 
 __attribute__((unused))
-static rf_status_t rf_recv_uint64(RsyncFetch_t *rf, uint64_t *d) {
+static inline rf_status_t rf_recv_uint64(RsyncFetch_t *rf, uint64_t *d) {
 	uint64_t le;
 	RF_PROPAGATE_ERROR(rf_recv_bytes(rf, (char *)&le, sizeof le));
 	*d = le64(le);
@@ -1021,6 +1128,12 @@ static void rf_flist_entry_clear(RsyncFetch_t *rf, rf_flist_entry_t *entry) {
 	rf_refstring_free(rf, &entry->group);
 	rf_refstring_free(rf, &entry->symlink);
 	rf_refstring_free(rf, &entry->hardlink);
+	PyObject *data_callback = entry->data_callback;
+	if(data_callback) {
+		rf_block_threads(rf);
+		entry->data_callback = NULL;
+		Py_DecRef(data_callback);
+	}
 }
 
 static void rf_flist_entry_free(RsyncFetch_t *rf, rf_flist_entry_t *entry) {
@@ -1139,6 +1252,7 @@ static void rf_flist_free(RsyncFetch_t *rf, rf_flist_t **flistp) {
 	if(flistp) {
 		rf_flist_t *flist = *flistp;
 		if(flist) {
+			bool threads_unblocked = (bool)rf->py_thread_state;
 			rf_flist_t *next = flist->next;
 			rf_flist_t *prev = flist->prev;
 			if(next)
@@ -1149,8 +1263,16 @@ static void rf_flist_free(RsyncFetch_t *rf, rf_flist_t **flistp) {
 				prev->next = next;
 			else
 				rf->flists_head = next;
-			free(flist->entries);
+			rf_flist_entry_t **entries = flist->entries;
+			if(entries) {
+				size_t num = flist->num;
+				for(size_t i = 0; i < num; i++)
+					rf_flist_entry_free(rf, entries[i]);
+				free(entries);
+			}
 			free(flist);
+			if(threads_unblocked)
+				rf_unblock_threads(rf);
 		}
 		*flistp = NULL;
 	}
@@ -1402,15 +1524,45 @@ static rf_status_t rf_recv_flist(RsyncFetch_t *rf) {
 	rf_flist_entry_t **entries = flist->entries;
 	for(size_t i = 0; i < num; i++) {
 		rf_flist_entry_t *entry = entries[i];
-		if(S_ISREG(entry->mode) && !entry->hardlink) {
-			RF_PROPAGATE_ERROR(rf_send_ndx(rf, offset + i));
-			RF_PROPAGATE_ERROR(rf_send_uint16(rf, ITEM_TRANSFER));
-			RF_PROPAGATE_ERROR(rf_send_uint32(rf, 0)); // number of checksums
-			RF_PROPAGATE_ERROR(rf_send_uint32(rf, MAX_BLOCK_SIZE)); // block length
-			RF_PROPAGATE_ERROR(rf_send_uint32(rf, 2)); // checksum length
-			RF_PROPAGATE_ERROR(rf_send_uint32(rf, 0)); // remainder length
+
+		rf_block_threads(rf);
+		PyObject *args = Py_BuildValue("y#LLLLy#Ly#LLy#y#",
+			entry->name, rf_refstring_len(entry->name),
+			(long long)entry->size,
+			(long long)entry->mtime,
+			(long long)entry->mode,
+			(long long)entry->uid,
+			entry->user, rf_refstring_len(entry->user),
+			(long long)entry->gid,
+			entry->group, rf_refstring_len(entry->group),
+			(long long)entry->major,
+			(long long)entry->minor,
+			entry->symlink, rf_refstring_len(entry->symlink),
+			entry->hardlink, rf_refstring_len(entry->hardlink)
+		);
+		if(!args)
+			return RF_STATUS_PYTHON;
+		PyObject *result = PyObject_CallObject(rf->entry_callback, args);
+		Py_DecRef(args);
+		if(!result)
+			return RF_STATUS_PYTHON;
+		if(result == Py_None) {
+			Py_DecRef(result);
+		} else {
+			if(S_ISREG(entry->mode) && !entry->hardlink) {
+				entry->data_callback = result;
+				RF_PROPAGATE_ERROR(rf_send_ndx(rf, offset + i));
+				RF_PROPAGATE_ERROR(rf_send_uint16(rf, ITEM_TRANSFER));
+				RF_PROPAGATE_ERROR(rf_send_uint32(rf, 0)); // number of checksums
+				RF_PROPAGATE_ERROR(rf_send_uint32(rf, MAX_BLOCK_SIZE)); // block length
+				RF_PROPAGATE_ERROR(rf_send_uint32(rf, 2)); // checksum length
+				RF_PROPAGATE_ERROR(rf_send_uint32(rf, 0)); // remainder length
+			} else {
+				Py_DecRef(result);
+			}
 		}
 	}
+	rf_unblock_threads(rf);
 	RF_PROPAGATE_ERROR(rf_send_ndx(rf, NDX_DONE));
 	return RF_STATUS_OK;
 }
@@ -1462,7 +1614,6 @@ static rf_status_t rf_talk(RsyncFetch_t *rf) {
 				break;
 		} else if(ndx > 0) {
 			// recv_attrs
-			//rf_flist_entry_t *entry = rf_find_ndx(rf, ndx);
 			uint16_t iflags;
 			RF_PROPAGATE_ERROR(rf_recv_uint16(rf, &iflags));
 			uint8_t b;
@@ -1487,6 +1638,11 @@ static rf_status_t rf_talk(RsyncFetch_t *rf) {
 			if(number_of_checksums)
 				return RF_STATUS_PROTO;
 
+			rf_flist_entry_t *entry = rf_find_ndx(rf, ndx);
+			PyObject *data_callback = entry->data_callback;
+			if(!data_callback)
+				return RF_STATUS_PROTO;
+
 			for(;;) {
 				uint32_t len;
 				RF_PROPAGATE_ERROR(rf_recv_uint32(rf, &len));
@@ -1498,10 +1654,34 @@ static rf_status_t rf_talk(RsyncFetch_t *rf) {
 				if(!buf)
 					return RF_STATUS_ERRNO;
 				rf_status_t s = rf_recv_bytes(rf, buf, len);
-				free(buf);
-				if(s != RF_STATUS_OK)
+				if(s != RF_STATUS_OK) {
+					free(buf);
 					return s;
+				}
+
+				rf_block_threads(rf);
+				PyObject *args = Py_BuildValue("(y#)", buf, (Py_ssize_t)len);
+				free(buf);
+				if(!args)
+					return RF_STATUS_PYTHON;
+				PyObject *result = PyObject_CallObject(data_callback, args);
+				Py_DecRef(args);
+				if(!result)
+					return RF_STATUS_PYTHON;
+				Py_DecRef(result);
+				rf_unblock_threads(rf);
 			}
+
+			rf_block_threads(rf);
+			PyObject *args = PyTuple_New(0);
+			if(!args)
+				return RF_STATUS_PYTHON;
+			PyObject *result = PyObject_CallObject(data_callback, args);
+			Py_DecRef(args);
+			if(!result)
+				return RF_STATUS_PYTHON;
+			Py_DecRef(result);
+			rf_unblock_threads(rf);
 
 			char md5[16];
 			RF_PROPAGATE_ERROR(rf_recv_bytes(rf, md5, sizeof md5));
@@ -1564,7 +1744,7 @@ static rf_status_t rf_run(RsyncFetch_t *rf) {
 					signal(SIGXFSZ, SIG_DFL);
 #endif
 
-					char * const argv[] = { "/usr/bin/rsync", "--server", "--sender", "-lHogDtpre.iLsf", "/usr", NULL };
+					char * const argv[] = { "/usr/bin/rsync", "--server", "--sender", "-lHogDtpre.iLsf", "/usr/bin", NULL };
 					execvp(argv[0], argv);
 					perror("execvp");
 					_exit(2);
@@ -1661,7 +1841,29 @@ static PyObject *RsyncFetch_run(PyObject *self, PyObject *args) {
 		return NULL;
 	rf->closed = true;
 
-	if(rf_status_to_exception(rf, rf_run(rf)))
+	PyObject *entry_callback, *error_callback;
+	if(!PyArg_ParseTuple(args, "OO:run", &entry_callback, &error_callback))
+		return NULL;
+
+	if(entry_callback != Py_None) {
+		if(!PyCallable_Check(entry_callback))
+			return NULL;
+		Py_IncRef(entry_callback);
+		rf->entry_callback = entry_callback;
+	}
+
+	if(error_callback != Py_None) {
+		if(!PyCallable_Check(error_callback))
+			return NULL;
+		Py_IncRef(error_callback);
+		rf->error_callback = error_callback;
+	}
+	
+	rf_unblock_threads(rf);
+	rf_status_t s = rf_run(rf);
+	rf_block_threads(rf);
+
+	if(rf_status_to_exception(rf, s))
 		Py_RETURN_NONE;
 	else
 		return NULL;
