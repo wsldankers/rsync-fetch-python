@@ -134,19 +134,23 @@ enum message_id {
 	MSG_INFO = 2,
 	MSG_ERROR = 3,
 	MSG_WARNING = 4,
-	MSG_ERROR_SOCKET = 5,
 	MSG_LOG = 6,
+	MSG_NOOP = 42,
+	MSG_DELETED = 101,
+
+	// integer type:
+	MSG_IO_ERROR = 22,
+	MSG_SUCCESS = 100,
+	MSG_NO_SEND = 102,
+
+	// rsync internal only (we should never see these):
+	MSG_ERROR_SOCKET = 5,
 	MSG_CLIENT = 7,
 	MSG_ERROR_UTF8 = 8,
 	MSG_REDO = 9,
 	MSG_FLIST = 20,
 	MSG_FLIST_EOF = 21,
-	MSG_IO_ERROR = 22,
-	MSG_NOOP = 42,
 	MSG_DONE = 86,
-	MSG_SUCCESS = 100,
-	MSG_DELETED = 101,
-	MSG_NO_SEND = 102,
 };
 
 typedef enum {
@@ -376,8 +380,6 @@ static rf_status_t rf_write_out_stream(RsyncFetch_t *rf) {
 	size_t multiplex_out_remaining = rf->multiplex_out_remaining;
 	if(multiplex_out_remaining)
 		RF_PROPAGATE_ERROR(rf_flush_output(rf));
-
-fprintf(stderr, "%s:%d: rf_write_out_stream(offset=%zu fill=%zu size=%zu)\n", __FILE__, __LINE__, offset, fill, size);
 
 	ssize_t r;
 	if(offset + fill > size) {
@@ -657,7 +659,7 @@ static rf_status_t rf_recv_bytes(RsyncFetch_t *rf, char *buf, size_t len) {
 					free(message);
 					return e;
 				}
-//fprintf(stderr, "<%d> ", channel);
+fprintf(stderr, "<%d> ", channel);
 fwrite(message, sizeof *message, multiplex_in_remaining, stderr);
 				// FIXME: handle message
 				free(message);
@@ -724,7 +726,6 @@ static rf_status_t rf_send_bytes_raw(RsyncFetch_t *rf, char *src, size_t len) {
 		start -= size;
 
 	if(len == 1) {
-//fprintf(stderr, "%s:%d: rf_send_bytes_raw(byte=%u)\n", __FILE__, __LINE__, *(uint8_t *)src);
 		buf[start] = *src;
 	} if(start + len > size) {
 		size_t amount = size - start;
@@ -736,7 +737,6 @@ static rf_status_t rf_send_bytes_raw(RsyncFetch_t *rf, char *src, size_t len) {
 
 	stream->fill = fill + len;
 
-//fprintf(stderr, "%s:%d: rf_send_bytes_raw(len=%zu fill=%zu)\n", __FILE__, __LINE__, len, fill + len);
 	return RF_STATUS_OK;
 }
 
@@ -745,7 +745,6 @@ static rf_status_t rf_send_bytes(RsyncFetch_t *rf, char *buf, size_t len) {
 		RF_PROPAGATE_ERROR(rf_flush_output(rf));
 		return rf_send_bytes_raw(rf, buf, len);
 	}
-//fprintf(stderr, "%s:%d: rf_send_bytes(len=%zu)\n", __FILE__, __LINE__, len);
 	size_t multiplex_out_remaining = rf->multiplex_out_remaining;
 	if(multiplex_out_remaining + len >= 0xFFFFFF) {
 		size_t chunk = 0xFFFFFF - multiplex_out_remaining;
@@ -928,42 +927,31 @@ static rf_status_t rf_recv_ndx(RsyncFetch_t *rf, int32_t *d) {
 	int32_t *prev_ptr;
 	bool is_positive;
 	uint8_t init;
-//fprintf(stderr, "%s:%d: recv_ndx()\n", __FILE__, __LINE__);
 	RF_PROPAGATE_ERROR(rf_recv_uint8(rf, &init));
-//fprintf(stderr, "%s:%d: recv_ndx()\n", __FILE__, __LINE__);
 	if(init == UINT8_C(0xFF)) {
-//fprintf(stderr, "%s:%d: recv_ndx()\n", __FILE__, __LINE__);
 		RF_PROPAGATE_ERROR(rf_recv_uint8(rf, &init));
-//fprintf(stderr, "%s:%d: recv_ndx()\n", __FILE__, __LINE__);
 		prev_ptr = &rf->prev_negative_ndx_in;
 		is_positive = false;
 	} else if(init) {
 		prev_ptr = &rf->prev_positive_ndx_in;
 		is_positive = true;
 	} else {
-//fprintf(stderr, "%s:%d: recv_ndx()\n", __FILE__, __LINE__);
 		return *d = NDX_DONE, RF_STATUS_OK;
 	}
 
 	int32_t ndx;
 	if(init == 0xFE) {
-//fprintf(stderr, "%s:%d: recv_ndx()\n", __FILE__, __LINE__);
 		RF_PROPAGATE_ERROR(rf_recv_uint8(rf, &init));
-//fprintf(stderr, "%s:%d: recv_ndx()\n", __FILE__, __LINE__);
 		if(init & 0x80) {
 			uint8_t extra_bytes[4];
-//fprintf(stderr, "%s:%d: recv_ndx()\n", __FILE__, __LINE__);
 			RF_PROPAGATE_ERROR(rf_recv_bytes(rf, (char *)extra_bytes, sizeof extra_bytes - 1));
-//fprintf(stderr, "%s:%d: recv_ndx()\n", __FILE__, __LINE__);
 			extra_bytes[sizeof extra_bytes - 1] = init & 0x7F;
 			ndx = 0;
 			for(int i = 0; i < sizeof extra_bytes; i++)
 				ndx |= extra_bytes[i] << (8 * i);
 		} else {
 			uint8_t onemorebyte;
-//fprintf(stderr, "%s:%d: recv_ndx()\n", __FILE__, __LINE__);
 			RF_PROPAGATE_ERROR(rf_recv_uint8(rf, &onemorebyte));
-//fprintf(stderr, "%s:%d: recv_ndx()\n", __FILE__, __LINE__);
 			ndx = ((init << 8) | onemorebyte) + *prev_ptr;
 		}
 	} else {
@@ -972,12 +960,10 @@ static rf_status_t rf_recv_ndx(RsyncFetch_t *rf, int32_t *d) {
 
 	*prev_ptr = ndx;
 	*d = is_positive ? ndx : -ndx;
-//fprintf(stderr, "%s:%d: recv_ndx()\n", __FILE__, __LINE__);
 	return RF_STATUS_OK;
 }
 
 static rf_status_t rf_send_ndx(RsyncFetch_t *rf, int32_t ndx) {
-//fprintf(stderr, "%s:%d: rf_send_ndx(%d)\n", __FILE__, __LINE__, ndx);
 	int32_t diff;
 	if(ndx == NDX_DONE) {
 		return rf_send_uint8(rf, 0);
@@ -1133,7 +1119,6 @@ static int rf_flist_entry_cmp(const void *ap, const void *bp) {
 }
 
 static rf_status_t rf_flist_new(RsyncFetch_t *rf, int32_t offset, rf_flist_t **flistp) {
-fprintf(stderr, "%s:%d: rf_flist_new(offset=%d)\n", __FILE__, __LINE__, offset);
 	rf_flist_t *flist = malloc(sizeof *flist);
 	if(!flist)
 		return RF_STATUS_ERRNO;
@@ -1152,7 +1137,6 @@ fprintf(stderr, "%s:%d: rf_flist_new(offset=%d)\n", __FILE__, __LINE__, offset);
 
 static void rf_flist_free(RsyncFetch_t *rf, rf_flist_t **flistp) {
 	if(flistp) {
-//fprintf(stderr, "%s:%d: rf_flist_free()\n", __FILE__, __LINE__);
 		rf_flist_t *flist = *flistp;
 		if(flist) {
 			rf_flist_t *next = flist->next;
@@ -1169,8 +1153,6 @@ static void rf_flist_free(RsyncFetch_t *rf, rf_flist_t **flistp) {
 			free(flist);
 		}
 		*flistp = NULL;
-	} else {
-//fprintf(stderr, "%s:%d: rf_flist_free(NULL)\n", __FILE__, __LINE__);
 	}
 }
 
@@ -1239,7 +1221,7 @@ static rf_status_t rf_fill_flist_entry(RsyncFetch_t *rf, rf_flist_entry_t *entry
 	size_t len2;
 	if(xflags & XMIT_LONG_NAME) {
 		int32_t s32;
-		RF_PROPAGATE_ERROR(rf_recv_int32(rf, &s32));
+		RF_PROPAGATE_ERROR(rf_recv_varint(rf, &s32));
 		len2 = s32;
 	} else {
 		RF_PROPAGATE_ERROR(rf_recv_uint8(rf, &b));
@@ -1257,7 +1239,7 @@ static rf_status_t rf_fill_flist_entry(RsyncFetch_t *rf, rf_flist_entry_t *entry
 	if(len1)
 		memcpy(name, last_name, len1);
 	RF_PROPAGATE_ERROR(rf_recv_bytes(rf, name + len1, len2));
-	if(memchr(entry->name, '\0', name_len))
+	if(memchr(name, '\0', name_len))
 		return RF_STATUS_PROTO;
 
 	RF_PROPAGATE_ERROR(rf_refstring_dup(rf, name, &rf->last.name));
@@ -1340,7 +1322,7 @@ static rf_status_t rf_fill_flist_entry(RsyncFetch_t *rf, rf_flist_entry_t *entry
 		RF_PROPAGATE_ERROR(rf_refstring_dup(rf, rf->last.group, &entry->group));
 	} else {
 		RF_PROPAGATE_ERROR(rf_recv_varint(rf, &entry->gid));
-		if(xflags & XMIT_USER_NAME_FOLLOWS) {
+		if(xflags & XMIT_GROUP_NAME_FOLLOWS) {
 			uint8_t len;
 			RF_PROPAGATE_ERROR(rf_recv_uint8(rf, &len));
 			char *group;
@@ -1421,15 +1403,12 @@ static rf_status_t rf_recv_flist(RsyncFetch_t *rf) {
 	for(size_t i = 0; i < num; i++) {
 		rf_flist_entry_t *entry = entries[i];
 		if(S_ISREG(entry->mode) && !entry->hardlink) {
-fprintf(stderr, "%s:%d: requesting name=%s (mode=%o hardlink=%s) ndx=%d i=%d offset=%d\n", __FILE__, __LINE__, entry->name, entry->mode, entry->hardlink, (int)(offset + i), (int)i, (int)offset);
 			RF_PROPAGATE_ERROR(rf_send_ndx(rf, offset + i));
 			RF_PROPAGATE_ERROR(rf_send_uint16(rf, ITEM_TRANSFER));
 			RF_PROPAGATE_ERROR(rf_send_uint32(rf, 0)); // number of checksums
 			RF_PROPAGATE_ERROR(rf_send_uint32(rf, MAX_BLOCK_SIZE)); // block length
 			RF_PROPAGATE_ERROR(rf_send_uint32(rf, 2)); // checksum length
 			RF_PROPAGATE_ERROR(rf_send_uint32(rf, 0)); // remainder length
-		} else {
-fprintf(stderr, "%s:%d: skipping   name=%s (mode=%o hardlink=%s)\n", __FILE__, __LINE__, entry->name, entry->mode, entry->hardlink);
 		}
 	}
 	RF_PROPAGATE_ERROR(rf_send_ndx(rf, NDX_DONE));
@@ -1469,25 +1448,19 @@ static rf_status_t rf_talk(RsyncFetch_t *rf) {
 
 	for(;;) {
 		int32_t ndx;
-//fprintf(stderr, "%s:%d: loop start\n", __FILE__, __LINE__);
 		RF_PROPAGATE_ERROR(rf_recv_ndx(rf, &ndx));
-//fprintf(stderr, "%s:%d: got ndx=%d\n", __FILE__, __LINE__, ndx);
 		if(ndx == NDX_FLIST_EOF) {
 			// do nothing
-//fprintf(stderr, "%s:%d: NDX_FLIST_EOF\n", __FILE__, __LINE__);
 		} else if(ndx == NDX_DONE) {
 			rf_flist_t *flist = rf->flists_head;
-//fprintf(stderr, "%s:%d: NDX_DONE flist=%s\n", __FILE__, __LINE__, flist ? "set" : "null");
 			rf_flist_free(rf, &flist);
 			if(!rf->flists_head) {
 				phase++;
-//fprintf(stderr, "%s:%d: phase=%d\n", __FILE__, __LINE__, phase);
 				RF_PROPAGATE_ERROR(rf_send_ndx(rf, NDX_DONE));
 			}
 			if(phase > 2)
 				break;
 		} else if(ndx > 0) {
-fprintf(stderr, "%s:%d: recv_attrs\n", __FILE__, __LINE__);
 			// recv_attrs
 			//rf_flist_entry_t *entry = rf_find_ndx(rf, ndx);
 			uint16_t iflags;
@@ -1501,7 +1474,6 @@ fprintf(stderr, "%s:%d: recv_attrs\n", __FILE__, __LINE__);
 				rf_refstring_free(rf, &refname);
 			}
 
-fprintf(stderr, "%s:%d: recv_sum_head\n", __FILE__, __LINE__);
 			// recv_sum_head
 			uint32_t number_of_checksums;
 			RF_PROPAGATE_ERROR(rf_recv_uint32(rf, &number_of_checksums));
@@ -1517,7 +1489,6 @@ fprintf(stderr, "%s:%d: recv_sum_head\n", __FILE__, __LINE__);
 
 			for(;;) {
 				uint32_t len;
-fprintf(stderr, "%s:%d: recv chunk\n", __FILE__, __LINE__);
 				RF_PROPAGATE_ERROR(rf_recv_uint32(rf, &len));
 				if(!len)
 					break;
@@ -1535,7 +1506,6 @@ fprintf(stderr, "%s:%d: recv chunk\n", __FILE__, __LINE__);
 			char md5[16];
 			RF_PROPAGATE_ERROR(rf_recv_bytes(rf, md5, sizeof md5));
 		} else {
-//fprintf(stderr, "%s:%d: extra flist\n", __FILE__, __LINE__);
 			// ndx = NDX_FLIST_OFFSET - ndx
 			RF_PROPAGATE_ERROR(rf_recv_flist(rf));
 		}
@@ -1594,7 +1564,7 @@ static rf_status_t rf_run(RsyncFetch_t *rf) {
 					signal(SIGXFSZ, SIG_DFL);
 #endif
 
-					char * const argv[] = { "/tmp/rsync", "--server", "--sender", "-lHogDtpre.iLsf", "/etc/network", NULL };
+					char * const argv[] = { "/usr/bin/rsync", "--server", "--sender", "-lHogDtpre.iLsf", "/usr", NULL };
 					execvp(argv[0], argv);
 					perror("execvp");
 					_exit(2);
@@ -1729,8 +1699,6 @@ static PyObject *RsyncFetch_writebytes(PyObject *self, PyObject *bytes) {
 	Py_ssize_t len;
 	if(PyBytes_AsStringAndSize(bytes, &buf, &len) == -1)
 		return NULL;
-
-//fprintf(stderr, "%s:%d: len=%zd\n", __FILE__, __LINE__, len);
 
 	if(rf_status_to_exception(rf, rf_send_bytes(rf, buf, len)))
 		Py_RETURN_NONE;
