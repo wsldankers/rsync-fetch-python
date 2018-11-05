@@ -198,7 +198,8 @@ typedef struct RsyncFetch {
 	size_t flists_num;
 	size_t flists_size;
 	rf_flist_entry_t last;
-	size_t multiplex_remaining;
+	size_t multiplex_in_remaining;
+	size_t multiplex_out_remaining;
 	int32_t ndx;
 	int32_t prev_negative_ndx_in;
 	int32_t prev_positive_ndx_in;
@@ -324,12 +325,52 @@ static int create_pipe(int *fds) {
 	return 0;
 }
 
+static rf_status_t rf_flush_output(RsyncFetch_t *rf) {
+	size_t multiplex_out_remaining = rf->multiplex_out_remaining;
+	if(multiplex_out_remaining) {
+		pipestream_t *stream = &rf->stream[RF_STREAM_OUT];
+		size_t start = stream->offset + stream->fill - multiplex_out_remaining - 4;
+		size_t size = stream->size;
+		char *buf = stream->buf;
+		if(start >= size) {
+			start -= size;
+			buf[start] = multiplex_out_remaining;
+			buf[start + 1] = multiplex_out_remaining >> 8;
+			buf[start + 2] = multiplex_out_remaining >> 16;
+		} else {
+			switch(size - start) {
+				case 1:
+					buf[start] = multiplex_out_remaining;
+					buf[0] = multiplex_out_remaining >> 8;
+					buf[1] = multiplex_out_remaining >> 16;
+				break;
+				case 2:
+					buf[start] = multiplex_out_remaining;
+					buf[start + 1] = multiplex_out_remaining >> 8;
+					buf[0] = multiplex_out_remaining >> 16;
+				break;
+				default:
+					buf[start] = multiplex_out_remaining;
+					buf[start + 1] = multiplex_out_remaining >> 8;
+					buf[start + 2] = multiplex_out_remaining >> 16;
+			}
+		}
+		
+		rf->multiplex_out_remaining = 0;
+	}
+	return RF_STATUS_OK;
+}
+
 static rf_status_t rf_write_out_stream(RsyncFetch_t *rf) {
 	pipestream_t *stream = &rf->stream[RF_STREAM_OUT];
 	size_t fill = stream->fill;
 	size_t size = stream->size;
 	size_t offset = stream->offset;
 	char *buf = stream->buf;
+
+	size_t multiplex_out_remaining = rf->multiplex_out_remaining;
+	if(multiplex_out_remaining)
+		RF_PROPAGATE_ERROR(rf_flush_output(rf));
 
 	ssize_t r;
 	if(offset + fill > size) {
@@ -353,6 +394,8 @@ fprintf(stderr, "%s:%d: rf_write_out_stream(offset=%zu fill=%zu size=%zu)\n", __
 		stream->fill = fill;
 		offset += r;
 		stream->offset = offset < size ? offset : offset - size;
+		if(multiplex_out_remaining && fill >= multiplex_out_remaining + 4)
+			rf->multiplex_out_remaining = multiplex_out_remaining;
 	} else {
 		stream->fill = 0;
 		stream->offset = 0;
@@ -579,39 +622,39 @@ static rf_status_t rf_recv_bytes(RsyncFetch_t *rf, char *buf, size_t len) {
 	if(!rf->multiplex)
 		return rf_recv_bytes_raw(rf, buf, len);
 
-	size_t multiplex_remaining = rf->multiplex_remaining;
+	size_t multiplex_in_remaining = rf->multiplex_in_remaining;
 	for(;;) {
-		if(multiplex_remaining < len) {
-			if(multiplex_remaining) {
-				RF_PROPAGATE_ERROR(rf_recv_bytes_raw(rf, buf, multiplex_remaining));
-				buf += multiplex_remaining;
-				len -= multiplex_remaining;
+		if(multiplex_in_remaining < len) {
+			if(multiplex_in_remaining) {
+				RF_PROPAGATE_ERROR(rf_recv_bytes_raw(rf, buf, multiplex_in_remaining));
+				buf += multiplex_in_remaining;
+				len -= multiplex_in_remaining;
 			}
 		} else {
-			rf->multiplex_remaining = multiplex_remaining - len;
+			rf->multiplex_in_remaining = multiplex_in_remaining - len;
 			return rf_recv_bytes_raw(rf, buf, len);
 		}
 
 		for(;;) {
 			uint8_t mplex[4];
 			RF_PROPAGATE_ERROR(rf_recv_bytes_raw(rf, (char *)mplex, sizeof mplex));
-			multiplex_remaining = mplex[0] | mplex[1] << 8 | mplex[2] << 16;
+			multiplex_in_remaining = mplex[0] | mplex[1] << 8 | mplex[2] << 16;
 			int channel = (int)mplex[3] - MPLEX_BASE;
 
 			if(channel == MSG_DATA)
 				break;
 
-			if(multiplex_remaining) {
-				char *message = malloc(multiplex_remaining);
+			if(multiplex_in_remaining) {
+				char *message = malloc(multiplex_in_remaining);
 				if(!message)
 					return false;
-				rf_status_t e = rf_recv_bytes_raw(rf, message, multiplex_remaining);
+				rf_status_t e = rf_recv_bytes_raw(rf, message, multiplex_in_remaining);
 				if(e != RF_STATUS_OK) {
 					free(message);
 					return e;
 				}
 fprintf(stderr, "<%d> ", channel);
-fwrite(message, sizeof *message, multiplex_remaining, stderr);
+fwrite(message, sizeof *message, multiplex_in_remaining, stderr);
 				// FIXME: handle message
 				free(message);
 			} else {
@@ -694,17 +737,35 @@ fprintf(stderr, "%s:%d: rf_send_bytes_raw(len=%zu fill=%zu)\n", __FILE__, __LINE
 }
 
 static rf_status_t rf_send_bytes(RsyncFetch_t *rf, char *buf, size_t len) {
-	if(!rf->multiplex)
+	if(!rf->multiplex) {
+		RF_PROPAGATE_ERROR(rf_flush_output(rf));
 		return rf_send_bytes_raw(rf, buf, len);
-//fprintf(stderr, "%s:%d: rf_send_bytes(len=%zu)\n", __FILE__, __LINE__, len);
-	while(len) {
-		size_t chunk = len < 0xFFFFFF ? len : 0xFFFFFF;
-		uint8_t mplex[4] = { chunk, chunk >> 8, chunk >> 16, MSG_DATA + MPLEX_BASE };
-		RF_PROPAGATE_ERROR(rf_send_bytes_raw(rf, (char *)mplex, sizeof mplex));
-		RF_PROPAGATE_ERROR(rf_send_bytes_raw(rf, buf, chunk));
-		len -= chunk;
-		buf += chunk;
 	}
+//fprintf(stderr, "%s:%d: rf_send_bytes(len=%zu)\n", __FILE__, __LINE__, len);
+	size_t multiplex_out_remaining = rf->multiplex_out_remaining;
+	if(multiplex_out_remaining + len >= 0xFFFFFF) {
+		size_t chunk = 0xFFFFFF - multiplex_out_remaining;
+		RF_PROPAGATE_ERROR(rf_send_bytes_raw(rf, buf, chunk));
+		rf->multiplex_out_remaining = 0xFFFFFF;
+		RF_PROPAGATE_ERROR(rf_flush_output(rf));
+
+		buf += chunk;
+		len -= chunk;
+
+		while(len >= 0xFFFFFF) {
+			uint8_t mplex[4] = { 0xFF, 0xFF, 0xFF, MSG_DATA + MPLEX_BASE };
+			RF_PROPAGATE_ERROR(rf_send_bytes_raw(rf, (char *)mplex, sizeof mplex));
+			RF_PROPAGATE_ERROR(rf_send_bytes_raw(rf, buf, 0xFFFFFF));
+			len -= 0xFFFFFF;
+			buf += 0xFFFFFF;
+		}
+	}		
+
+	uint8_t mplex[4] = { 0, 0, 0, MSG_DATA + MPLEX_BASE };
+	RF_PROPAGATE_ERROR(rf_send_bytes_raw(rf, (char *)mplex, sizeof mplex));
+	RF_PROPAGATE_ERROR(rf_send_bytes_raw(rf, buf, len));
+	rf->multiplex_out_remaining = len;
+
 	return RF_STATUS_OK;
 }
 
