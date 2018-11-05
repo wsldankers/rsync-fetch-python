@@ -934,31 +934,42 @@ static rf_status_t rf_recv_ndx(RsyncFetch_t *rf, int32_t *d) {
 	int32_t *prev_ptr;
 	bool is_positive;
 	uint8_t init;
+fprintf(stderr, "%s:%d: recv_ndx()\n", __FILE__, __LINE__);
 	RF_PROPAGATE_ERROR(rf_recv_uint8(rf, &init));
+fprintf(stderr, "%s:%d: recv_ndx()\n", __FILE__, __LINE__);
 	if(init == UINT8_C(0xFF)) {
+fprintf(stderr, "%s:%d: recv_ndx()\n", __FILE__, __LINE__);
 		RF_PROPAGATE_ERROR(rf_recv_uint8(rf, &init));
+fprintf(stderr, "%s:%d: recv_ndx()\n", __FILE__, __LINE__);
 		prev_ptr = &rf->prev_negative_ndx_in;
 		is_positive = false;
 	} else if(init) {
 		prev_ptr = &rf->prev_positive_ndx_in;
 		is_positive = true;
 	} else {
-		return NDX_DONE;
+fprintf(stderr, "%s:%d: recv_ndx()\n", __FILE__, __LINE__);
+		return *d = NDX_DONE, RF_STATUS_OK;
 	}
 
 	int32_t ndx;
 	if(init == 0xFE) {
+fprintf(stderr, "%s:%d: recv_ndx()\n", __FILE__, __LINE__);
 		RF_PROPAGATE_ERROR(rf_recv_uint8(rf, &init));
+fprintf(stderr, "%s:%d: recv_ndx()\n", __FILE__, __LINE__);
 		if(init & 0x80) {
 			uint8_t extra_bytes[4];
+fprintf(stderr, "%s:%d: recv_ndx()\n", __FILE__, __LINE__);
 			RF_PROPAGATE_ERROR(rf_recv_bytes(rf, (char *)extra_bytes, sizeof extra_bytes - 1));
+fprintf(stderr, "%s:%d: recv_ndx()\n", __FILE__, __LINE__);
 			extra_bytes[sizeof extra_bytes - 1] = init & 0x7F;
 			ndx = 0;
 			for(int i = 0; i < sizeof extra_bytes; i++)
 				ndx |= extra_bytes[i] << (8 * i);
 		} else {
 			uint8_t onemorebyte;
+fprintf(stderr, "%s:%d: recv_ndx()\n", __FILE__, __LINE__);
 			RF_PROPAGATE_ERROR(rf_recv_uint8(rf, &onemorebyte));
+fprintf(stderr, "%s:%d: recv_ndx()\n", __FILE__, __LINE__);
 			ndx = ((init << 8) | onemorebyte) + *prev_ptr;
 		}
 	} else {
@@ -967,6 +978,7 @@ static rf_status_t rf_recv_ndx(RsyncFetch_t *rf, int32_t *d) {
 
 	*prev_ptr = ndx;
 	*d = is_positive ? ndx : -ndx;
+fprintf(stderr, "%s:%d: recv_ndx()\n", __FILE__, __LINE__);
 	return RF_STATUS_OK;
 }
 
@@ -1461,9 +1473,12 @@ static rf_status_t rf_talk(RsyncFetch_t *rf) {
 
 	for(;;) {
 		int32_t ndx;
+fprintf(stderr, "%s:%d: loop start\n", __FILE__, __LINE__);
 		RF_PROPAGATE_ERROR(rf_recv_ndx(rf, &ndx));
+fprintf(stderr, "%s:%d: got ndx=%d\n", __FILE__, __LINE__, ndx);
 		if(ndx == NDX_FLIST_EOF) {
 			// do nothing
+fprintf(stderr, "%s:%d: NDX_FLIST_EOF\n", __FILE__, __LINE__);
 		} else if(ndx == NDX_DONE) {
 			flist = rf->flists_head;
 fprintf(stderr, "%s:%d: NDX_DONE flist=%s\n", __FILE__, __LINE__, flist ? "set" : "null");
@@ -1490,6 +1505,7 @@ fprintf(stderr, "%s:%d: recv_attrs\n", __FILE__, __LINE__);
 				rf_refstring_free(rf, &refname);
 			}
 
+fprintf(stderr, "%s:%d: recv_sum_head\n", __FILE__, __LINE__);
 			// recv_sum_head
 			uint32_t number_of_checksums;
 			RF_PROPAGATE_ERROR(rf_recv_uint32(rf, &number_of_checksums));
@@ -1505,6 +1521,7 @@ fprintf(stderr, "%s:%d: recv_attrs\n", __FILE__, __LINE__);
 
 			for(;;) {
 				uint32_t len;
+fprintf(stderr, "%s:%d: recv chunk\n", __FILE__, __LINE__);
 				RF_PROPAGATE_ERROR(rf_recv_uint32(rf, &len));
 				if(!len)
 					break;
@@ -1522,9 +1539,11 @@ fprintf(stderr, "%s:%d: recv_attrs\n", __FILE__, __LINE__);
 			char md5[16];
 			RF_PROPAGATE_ERROR(rf_recv_bytes(rf, md5, sizeof md5));
 		} else {
+fprintf(stderr, "%s:%d: extra flist\n", __FILE__, __LINE__);
 			// ndx = NDX_FLIST_OFFSET - ndx
 			RF_PROPAGATE_ERROR(rf_recv_flist(rf, &flist));
 			// FIXME: handle flist
+fprintf(stderr, "%s:%d: handle flist\n", __FILE__, __LINE__);
 			RF_PROPAGATE_ERROR(rf_send_ndx(rf, NDX_DONE));
 		}
 	}
