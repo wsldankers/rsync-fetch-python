@@ -216,6 +216,10 @@ static const RsyncFetch_t RsyncFetch_0 = {
 	.magic = RSYNCFETCH_MAGIC,
 	.stream = { PIPESTREAM_INITIALIZER, PIPESTREAM_INITIALIZER, PIPESTREAM_INITIALIZER },
 	.ndx = 1,
+	.prev_negative_ndx_in = 1,
+	.prev_positive_ndx_in = -1,
+	.prev_negative_ndx_out = 1,
+	.prev_positive_ndx_out = -1,
 };
 
 struct RsyncFetchObject {
@@ -571,7 +575,6 @@ static rf_status_t rf_recv_bytes_raw(RsyncFetch_t *rf, char *dst, size_t len) {
 	return RF_STATUS_OK;
 }
 
-__attribute__((unused))
 static rf_status_t rf_wait_for_eof(RsyncFetch_t *rf) {
 	for(;;) {
 		if(rf->stream[RF_STREAM_IN].fill)
@@ -783,7 +786,6 @@ static rf_status_t rf_send_int8(RsyncFetch_t *rf, int8_t d) {
 	return rf_send_bytes(rf, (char *)&d, sizeof d);
 }
 
-__attribute__((unused))
 static rf_status_t rf_send_uint8(RsyncFetch_t *rf, uint8_t d) {
 	return rf_send_bytes(rf, (char *)&d, sizeof d);
 }
@@ -794,7 +796,6 @@ static rf_status_t rf_send_int16(RsyncFetch_t *rf, int16_t d) {
 	return rf_send_bytes(rf, (char *)&le, sizeof le);
 }
 
-__attribute__((unused))
 static rf_status_t rf_send_uint16(RsyncFetch_t *rf, uint16_t d) {
 	uint16_t le = le16(d);
 	return rf_send_bytes(rf, (char *)&le, sizeof le);
@@ -806,7 +807,6 @@ static rf_status_t rf_send_int32(RsyncFetch_t *rf, int32_t d) {
 	return rf_send_bytes(rf, (char *)&le, sizeof le);
 }
 
-__attribute__((unused))
 static rf_status_t rf_send_uint32(RsyncFetch_t *rf, uint32_t d) {
 	uint32_t le = le32(d);
 	return rf_send_bytes(rf, (char *)&le, sizeof le);
@@ -829,7 +829,6 @@ static rf_status_t rf_recv_int8(RsyncFetch_t *rf, int8_t *d) {
 	return rf_recv_bytes(rf, (char *)d, sizeof *d);
 }
 
-__attribute__((unused))
 static rf_status_t rf_recv_uint8(RsyncFetch_t *rf, uint8_t *d) {
 	return rf_recv_bytes(rf, (char *)d, sizeof *d);
 }
@@ -842,7 +841,6 @@ static rf_status_t rf_recv_int16(RsyncFetch_t *rf, int16_t *d) {
 	return RF_STATUS_OK;
 }
 
-__attribute__((unused))
 static rf_status_t rf_recv_uint16(RsyncFetch_t *rf, uint16_t *d) {
 	uint16_t le;
 	RF_PROPAGATE_ERROR(rf_recv_bytes(rf, (char *)&le, sizeof le));
@@ -850,7 +848,6 @@ static rf_status_t rf_recv_uint16(RsyncFetch_t *rf, uint16_t *d) {
 	return RF_STATUS_OK;
 }
 
-__attribute__((unused))
 static rf_status_t rf_recv_int32(RsyncFetch_t *rf, int32_t *d) {
 	int32_t le;
 	RF_PROPAGATE_ERROR(rf_recv_bytes(rf, (char *)&le, sizeof le));
@@ -858,7 +855,6 @@ static rf_status_t rf_recv_int32(RsyncFetch_t *rf, int32_t *d) {
 	return RF_STATUS_OK;
 }
 
-__attribute__((unused))
 static rf_status_t rf_recv_uint32(RsyncFetch_t *rf, uint32_t *d) {
 	uint32_t le;
 	RF_PROPAGATE_ERROR(rf_recv_bytes(rf, (char *)&le, sizeof le));
@@ -889,7 +885,6 @@ static const uint8_t rf_varint_extra[] = {
 	2, 2, 2, 2, 2, 2, 2, 2, 3, 3, 3, 3, 4, 4, 5, 6, // (C0 - FF)/4
 };
 
-__attribute__((unused))
 static rf_status_t rf_recv_varint(RsyncFetch_t *rf, int32_t *d) {
 	uint8_t init;
 	RF_PROPAGATE_ERROR(rf_recv_uint8(rf, &init));
@@ -908,7 +903,6 @@ static rf_status_t rf_recv_varint(RsyncFetch_t *rf, int32_t *d) {
 	return RF_STATUS_OK;
 }
 
-__attribute__((unused))
 static rf_status_t rf_recv_varlong(RsyncFetch_t *rf, size_t min_bytes, int64_t *d) {
 	if(min_bytes > 8)
 		return RF_STATUS_ASSERT;
@@ -930,7 +924,6 @@ static rf_status_t rf_recv_varlong(RsyncFetch_t *rf, size_t min_bytes, int64_t *
 	return RF_STATUS_OK;
 }
 
-__attribute__((unused))
 static rf_status_t rf_recv_ndx(RsyncFetch_t *rf, int32_t *d) {
 	int32_t *prev_ptr;
 	bool is_positive;
@@ -983,7 +976,6 @@ static rf_status_t rf_recv_ndx(RsyncFetch_t *rf, int32_t *d) {
 	return RF_STATUS_OK;
 }
 
-__attribute__((unused))
 static rf_status_t rf_send_ndx(RsyncFetch_t *rf, int32_t ndx) {
 //fprintf(stderr, "%s:%d: rf_send_ndx(%d)\n", __FILE__, __LINE__, ndx);
 	int32_t diff;
@@ -1015,7 +1007,6 @@ static rf_status_t rf_send_ndx(RsyncFetch_t *rf, int32_t ndx) {
 	}
 }
 
-__attribute__((unused))
 static rf_status_t rf_recv_vstring(RsyncFetch_t *rf, char **bufp) {
 	RF_PROPAGATE_ERROR(rf_refstring_free(rf, bufp));
 	uint8_t b;
@@ -1122,7 +1113,7 @@ static int rf_flist_entry_cmp(const void *ap, const void *bp) {
 		} else {
 			if(b_basename_len == 1 && b_basename[0] == '.')
 				return 1;
-			else
+			if(b_isdir)
 				return -1;
 		}
 		return memcmp2(a_basename, b_basename, a_basename_len, b_basename_len);
@@ -1142,11 +1133,12 @@ static int rf_flist_entry_cmp(const void *ap, const void *bp) {
 }
 
 static rf_status_t rf_flist_new(RsyncFetch_t *rf, int32_t offset, rf_flist_t **flistp) {
-//fprintf(stderr, "%s:%d: rf_flist_new()\n", __FILE__, __LINE__);
+fprintf(stderr, "%s:%d: rf_flist_new(offset=%d)\n", __FILE__, __LINE__, offset);
 	rf_flist_t *flist = malloc(sizeof *flist);
 	if(!flist)
 		return RF_STATUS_ERRNO;
 	*flist = rf_flist_0;
+	flist->offset = offset;
 	rf_flist_t *tail = rf->flists_tail;
 	if(tail)
 		tail->next = flist;
@@ -1158,7 +1150,6 @@ static rf_status_t rf_flist_new(RsyncFetch_t *rf, int32_t offset, rf_flist_t **f
 	return RF_STATUS_OK;
 }
 
-__attribute__((unused))
 static void rf_flist_free(RsyncFetch_t *rf, rf_flist_t **flistp) {
 	if(flistp) {
 //fprintf(stderr, "%s:%d: rf_flist_free()\n", __FILE__, __LINE__);
@@ -1183,7 +1174,6 @@ static void rf_flist_free(RsyncFetch_t *rf, rf_flist_t **flistp) {
 	}
 }
 
-__attribute__((unused))
 static rf_status_t rf_flist_add_entry(RsyncFetch_t *rf, rf_flist_t *flist, rf_flist_entry_t *entry) {
 	size_t num = flist->num;
 	size_t size = flist->size;
@@ -1386,7 +1376,6 @@ static rf_status_t rf_fill_flist_entry(RsyncFetch_t *rf, rf_flist_entry_t *entry
 	return RF_STATUS_OK;
 }
 
-__attribute__((unused))
 static rf_status_t rf_recv_flist_entry(RsyncFetch_t *rf, rf_flist_entry_t **entryp) {
 	uint8_t b;
 	RF_PROPAGATE_ERROR(rf_recv_uint8(rf, &b));
@@ -1432,7 +1421,7 @@ static rf_status_t rf_recv_flist(RsyncFetch_t *rf) {
 	for(size_t i = 0; i < num; i++) {
 		rf_flist_entry_t *entry = entries[i];
 		if(S_ISREG(entry->mode) && !entry->hardlink) {
-fprintf(stderr, "%s:%d: requesting name=%s (mode=%o hardlink=%s)\n", __FILE__, __LINE__, entry->name, entry->mode, entry->hardlink);
+fprintf(stderr, "%s:%d: requesting name=%s (mode=%o hardlink=%s) ndx=%d i=%d offset=%d\n", __FILE__, __LINE__, entry->name, entry->mode, entry->hardlink, (int)(offset + i), (int)i, (int)offset);
 			RF_PROPAGATE_ERROR(rf_send_ndx(rf, offset + i));
 			RF_PROPAGATE_ERROR(rf_send_uint16(rf, ITEM_TRANSFER));
 			RF_PROPAGATE_ERROR(rf_send_uint32(rf, 0)); // number of checksums
@@ -1480,9 +1469,9 @@ static rf_status_t rf_talk(RsyncFetch_t *rf) {
 
 	for(;;) {
 		int32_t ndx;
-fprintf(stderr, "%s:%d: loop start\n", __FILE__, __LINE__);
+//fprintf(stderr, "%s:%d: loop start\n", __FILE__, __LINE__);
 		RF_PROPAGATE_ERROR(rf_recv_ndx(rf, &ndx));
-fprintf(stderr, "%s:%d: got ndx=%d\n", __FILE__, __LINE__, ndx);
+//fprintf(stderr, "%s:%d: got ndx=%d\n", __FILE__, __LINE__, ndx);
 		if(ndx == NDX_FLIST_EOF) {
 			// do nothing
 //fprintf(stderr, "%s:%d: NDX_FLIST_EOF\n", __FILE__, __LINE__);
