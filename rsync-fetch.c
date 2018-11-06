@@ -201,6 +201,7 @@ typedef struct RsyncFetch {
 	char *chunk_buffer;
 	char **command;
 	char **filters;
+	size_t filters_num;
 	rf_flist_t *flist;
 	rf_flist_t *flists_head;
 	rf_flist_t *flists_tail;
@@ -367,7 +368,7 @@ static rf_status_t rf_iterate(RsyncFetch_t *rf, PyObject *iterable, char ***list
 	rf_status_t s = RF_STATUS_OK;
 
 	size_t fill = 0;
-	size_t size = 16;
+	size_t size = 32;
 	while(size < RF_BUFNUM_ADJUSTMENT)
 		size <<= 1;
 	size -= RF_BUFNUM_ADJUSTMENT;
@@ -420,7 +421,7 @@ static rf_status_t rf_iterate(RsyncFetch_t *rf, PyObject *iterable, char ***list
 
 		size_t converted = 0;
 		if(s == RF_STATUS_OK) {
-			// do an extra '+ fill' to accomodate the \0 for each string
+			// tack on an extra '+ fill' to accomodate the \0 for each string
 			void **newlist = realloc(list, (fill + 1) * sizeof *list + total + fill);
 			if(newlist) {
 				list = newlist;
@@ -439,17 +440,18 @@ static rf_status_t rf_iterate(RsyncFetch_t *rf, PyObject *iterable, char ***list
 					memcpy(string_location, buf, len);
 					string_location += len;
 				}
-				list[fill] = NULL;
+				list[fill] = string_location;
 			} else {
 				s = RF_STATUS_ERRNO;
 			}
 		}
 
 		if(s == RF_STATUS_OK) {
-			if(listp)
-				*listp = (char **)list;
+			*listp = (char **)list;
 			if(countp)
 				*countp = fill;
+			else
+				list[fill] = NULL;
 		} else {
 			for(size_t i = converted; i < fill; i++)
 				Py_DecRef(list[i]);
@@ -1716,9 +1718,10 @@ static rf_status_t rf_talk(RsyncFetch_t *rf) {
 
 	char **filters = rf->filters;
 	if(filters) {
-		for(size_t i = 0; filters[i]; i++) {
+		size_t num = rf->filters_num;
+		for(size_t i = 0; i < num; i++) {
 			char *filter = filters[i];
-			size_t filter_len = strlen(filter);
+			size_t filter_len = filters[i + 1] - filter - 1;
 			RF_PROPAGATE_ERROR(rf_send_uint32(rf, filter_len));
 			RF_PROPAGATE_ERROR(rf_send_bytes(rf, filter, filter_len));
 		}
@@ -2025,7 +2028,7 @@ static rf_status_t rf_init(RsyncFetch_t *rf, PyObject *args, PyObject *kwargs) {
 	}
 
 	if(filters && filters != Py_None)
-		RF_PROPAGATE_ERROR(rf_iterate(rf, filters, &rf->filters, NULL));
+		RF_PROPAGATE_ERROR(rf_iterate(rf, filters, &rf->filters, &rf->filters_num));
 
 	return RF_STATUS_OK;
 }
