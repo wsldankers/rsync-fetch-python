@@ -365,16 +365,15 @@ static rf_status_t rf_iterate(RsyncFetch_t *rf, PyObject *iterable, char ***list
 		return RF_STATUS_PYTHON;
 
 	rf_status_t s = RF_STATUS_OK;
-	char **list;
 
 	size_t fill = 0;
 	size_t size = 16;
 	while(size < RF_BUFNUM_ADJUSTMENT)
 		size <<= 1;
 	size -= RF_BUFNUM_ADJUSTMENT;
-	PyObject **objlist = malloc(size * sizeof *objlist);
+	void **list = malloc(size * sizeof *list);
 
-	if(objlist) {
+	if(list) {
 		for(;;) {
 			PyObject *item = PyIter_Next(iterator);
 			if(!item) {
@@ -391,15 +390,15 @@ static rf_status_t rf_iterate(RsyncFetch_t *rf, PyObject *iterable, char ***list
 
 			if(fill == size) {
 				size = ((size + RF_BUFNUM_ADJUSTMENT) << 1) - RF_BUFNUM_ADJUSTMENT;
-				PyObject **newobjlist = realloc(objlist, size * sizeof *objlist);
-				if(!newobjlist) {
+				void **newlist = realloc(list, size * sizeof *list);
+				if(!newlist) {
 					s = RF_STATUS_ERRNO;
 					break;
 				}
-				objlist = newobjlist;
+				list = newlist;
 			}
 
-			objlist[fill++] = bytes;
+			list[fill++] = bytes;
 		}
 
 		// OK, we now have a list with bytes items (we hope).
@@ -410,7 +409,7 @@ static rf_status_t rf_iterate(RsyncFetch_t *rf, PyObject *iterable, char ***list
 		size_t total = 0;
 		if(s == RF_STATUS_OK) {
 			for(size_t i = 0; i < fill; i++) {
-				Py_ssize_t len = PyBytes_Size(objlist[i]);
+				Py_ssize_t len = PyBytes_Size(list[i]);
 				if(i == -1) {
 					s = RF_STATUS_PYTHON;
 					break;
@@ -419,19 +418,23 @@ static rf_status_t rf_iterate(RsyncFetch_t *rf, PyObject *iterable, char ***list
 			}
 		}
 
+		size_t converted = 0;
 		if(s == RF_STATUS_OK) {
-			// extra '+ fill' to accomodate a \0 for each item
-			list = malloc((fill + 1) * sizeof *list + total + fill);
-			if(list) {
+			// do an extra '+ fill' to accomodate the \0 for each string
+			void **newlist = realloc(list, (fill + 1) * sizeof *list + total + fill);
+			if(newlist) {
+				list = newlist;
 				char *string_location = (char *)(list + fill + 1);
 				for(size_t i = 0; i < fill; i++) {
 					Py_ssize_t len;
 					char *buf;
-					if(PyBytes_AsStringAndSize(objlist[i], &buf, &len) == -1) {
+					if(PyBytes_AsStringAndSize(list[i], &buf, &len) == -1) {
 						s = RF_STATUS_PYTHON;
 						break;
 					}
+					Py_DecRef(list[i]);
 					list[i] = string_location;
+					converted++;
 					len++; // include the trailing \0
 					memcpy(string_location, buf, len);
 					string_location += len;
@@ -440,20 +443,18 @@ static rf_status_t rf_iterate(RsyncFetch_t *rf, PyObject *iterable, char ***list
 			} else {
 				s = RF_STATUS_ERRNO;
 			}
-
-			if(s == RF_STATUS_OK) {
-				if(listp)
-					*listp = list;
-				if(countp)
-					*countp = fill;
-			} else {
-				free(list);
-			}
 		}
 
-		for(size_t i = 0; i < fill; i++)
-			Py_DecRef(objlist[i]);
-		free(objlist);
+		if(s == RF_STATUS_OK) {
+			if(listp)
+				*listp = (char **)list;
+			if(countp)
+				*countp = fill;
+		} else {
+			for(size_t i = converted; i < fill; i++)
+				Py_DecRef(list[i]);
+			free(list);
+		}
 	} else {
 		s = RF_STATUS_ERRNO;
 	}
@@ -1892,8 +1893,8 @@ static rf_status_t rf_run(RsyncFetch_t *rf) {
 					signal(SIGXFSZ, SIG_DFL);
 #endif
 
-					char * const argv[] = { "/usr/bin/rsync", "--server", "--sender", "-lHogDtpre.iLsf", "/etc/network", NULL };
-					execvp(argv[0], argv);
+					char **command = rf->command;
+					execvp(command[0], command);
 					perror("execvp");
 					_exit(2);
 				} else if(pid != -1) {
