@@ -1376,6 +1376,7 @@ static rf_status_t rf_fill_flist_entry(RsyncFetch_t *rf, rf_flist_entry_t *entry
 		rf_flist_t *flist = rf->flist;
 		if(hlink < flist->offset) {
 			hardlink = rf_find_ndx(rf, hlink);
+			RF_PROPAGATE_ERROR(rf_refstring_dup(rf, hardlink->name, &entry->hardlink));
 		} else {
 			hardlink = rf_flist_get_entry(rf, flist, hlink);
 
@@ -1398,9 +1399,9 @@ static rf_status_t rf_fill_flist_entry(RsyncFetch_t *rf, rf_flist_entry_t *entry
 			RF_PROPAGATE_ERROR(rf_refstring_dup(rf, user, &rf->last.user));
 			RF_PROPAGATE_ERROR(rf_refstring_dup(rf, group, &rf->last.group));
 
+			RF_PROPAGATE_ERROR(rf_refstring_dup(rf, hardlink->name, &entry->hardlink));
 			return RF_STATUS_OK;
 		}
-		RF_PROPAGATE_ERROR(rf_refstring_dup(rf, hardlink->name, &entry->hardlink));
 	} else {
 		hardlink = NULL;
 	}
@@ -1744,7 +1745,7 @@ static rf_status_t rf_run(RsyncFetch_t *rf) {
 					signal(SIGXFSZ, SIG_DFL);
 #endif
 
-					char * const argv[] = { "/usr/bin/rsync", "--server", "--sender", "-lHogDtpre.iLsf", "/usr/bin", NULL };
+					char * const argv[] = { "/usr/bin/rsync", "--server", "--sender", "-lHogDtpre.iLsf", "/tmp/derp", NULL };
 					execvp(argv[0], argv);
 					perror("execvp");
 					_exit(2);
