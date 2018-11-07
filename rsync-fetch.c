@@ -1701,7 +1701,72 @@ static rf_status_t rf_recv_flist(RsyncFetch_t *rf) {
 	return RF_STATUS_OK;
 }
 
-static rf_status_t rf_talk(RsyncFetch_t *rf) {
+static rf_status_t rf_recv_filedata(RsyncFetch_t *rf, rf_flist_entry_t *entry) {
+	PyObject *data_callback = entry->data_callback;
+	if(!data_callback)
+		return RF_STATUS_PROTO;
+
+	for(;;) {
+		uint32_t len;
+		RF_PROPAGATE_ERROR(rf_recv_uint32(rf, &len));
+		if(!len)
+			break;
+		if(len > MAX_BLOCK_SIZE)
+			return RF_STATUS_PROTO;
+		char *buf = rf->chunk_buffer;
+		if(!buf)
+			return RF_STATUS_ASSERT;
+		RF_PROPAGATE_ERROR(rf_recv_bytes(rf, buf, len));
+
+		rf_block_threads(rf);
+
+		PyObject *chunk_bytes = rf->chunk_bytes;
+		rf->chunk_buffer = NULL;
+		if(_PyBytes_Resize(&chunk_bytes, len) == -1) {
+			// if this fails the old copy is gone too
+			rf->chunk_bytes = NULL;
+			return RF_STATUS_PYTHON;
+		}
+		PyObject *args = PyTuple_Pack(1, chunk_bytes);
+		if(!args) {
+			// might have been moved by _PyBytes_Resize()
+			rf->chunk_bytes = chunk_bytes;
+			return RF_STATUS_PYTHON;
+		}
+		// now owned by the args tuple
+		rf->chunk_bytes = NULL;
+
+		PyObject *result = PyObject_CallObject(data_callback, args);
+		Py_DecRef(args);
+		if(!result)
+			return RF_STATUS_PYTHON;
+		Py_DecRef(result);
+
+		// allocate a new one for the next chunk (while we still hold the GIL)
+		chunk_bytes = PyBytes_FromStringAndSize(NULL, MAX_BLOCK_SIZE);
+		if(!chunk_bytes)
+			return RF_STATUS_PYTHON;
+		rf->chunk_bytes = chunk_bytes;
+		rf->chunk_buffer = PyBytes_AS_STRING(chunk_bytes);
+		
+		rf_unblock_threads(rf);
+	}
+
+	rf_block_threads(rf);
+	PyObject *args = PyTuple_New(0);
+	if(!args)
+		return RF_STATUS_PYTHON;
+	PyObject *result = PyObject_CallObject(data_callback, args);
+	Py_DecRef(args);
+	if(!result)
+		return RF_STATUS_PYTHON;
+	Py_DecRef(result);
+	rf_unblock_threads(rf);
+
+	return RF_STATUS_OK;
+}
+
+static rf_status_t rf_mainloop(RsyncFetch_t *rf) {
 	uint32_t remote_protocol;
 	RF_PROPAGATE_ERROR(rf_recv_uint32(rf, &remote_protocol));
 	if(remote_protocol < 30)
@@ -1773,70 +1838,10 @@ static rf_status_t rf_talk(RsyncFetch_t *rf) {
 			if(number_of_checksums)
 				return RF_STATUS_PROTO;
 
-			rf_flist_entry_t *entry = rf_find_ndx(rf, ndx);
-			PyObject *data_callback = entry->data_callback;
-			if(!data_callback)
-				return RF_STATUS_PROTO;
-
-			for(;;) {
-				uint32_t len;
-				RF_PROPAGATE_ERROR(rf_recv_uint32(rf, &len));
-				if(!len)
-					break;
-				if(len > MAX_BLOCK_SIZE)
-					return RF_STATUS_PROTO;
-				char *buf = rf->chunk_buffer;
-				if(!buf)
-					return RF_STATUS_ASSERT;
-				RF_PROPAGATE_ERROR(rf_recv_bytes(rf, buf, len));
-
-				rf_block_threads(rf);
-
-				PyObject *chunk_bytes = rf->chunk_bytes;
-				rf->chunk_buffer = NULL;
-				if(_PyBytes_Resize(&chunk_bytes, len) == -1) {
-					// if this fails the old copy is gone too
-					rf->chunk_bytes = NULL;
-					return RF_STATUS_PYTHON;
-				}
-				PyObject *args = PyTuple_Pack(1, chunk_bytes);
-				if(!args) {
-					// might have been moved by _PyBytes_Resize()
-					rf->chunk_bytes = chunk_bytes;
-					return RF_STATUS_PYTHON;
-				}
-				// now owned by the args tuple
-				rf->chunk_bytes = NULL;
-
-				PyObject *result = PyObject_CallObject(data_callback, args);
-				Py_DecRef(args);
-				if(!result)
-					return RF_STATUS_PYTHON;
-				Py_DecRef(result);
-
-				// allocate a new one for the next chunk (while we still hold the GIL)
-				chunk_bytes = PyBytes_FromStringAndSize(NULL, MAX_BLOCK_SIZE);
-				if(!chunk_bytes)
-					return RF_STATUS_PYTHON;
-				rf->chunk_bytes = chunk_bytes;
-				rf->chunk_buffer = PyBytes_AS_STRING(chunk_bytes);
-				
-				rf_unblock_threads(rf);
-			}
+			RF_PROPAGATE_ERROR(rf_recv_filedata(rf, rf_find_ndx(rf, ndx)));
 
 			char md5[16];
 			RF_PROPAGATE_ERROR(rf_recv_bytes(rf, md5, sizeof md5));
-
-			rf_block_threads(rf);
-			PyObject *args = PyTuple_New(0);
-			if(!args)
-				return RF_STATUS_PYTHON;
-			PyObject *result = PyObject_CallObject(data_callback, args);
-			Py_DecRef(args);
-			if(!result)
-				return RF_STATUS_PYTHON;
-			Py_DecRef(result);
-			rf_unblock_threads(rf);
 		} else {
 			// ndx = NDX_FLIST_OFFSET - ndx
 			RF_PROPAGATE_ERROR(rf_recv_flist(rf));
@@ -1908,7 +1913,7 @@ static rf_status_t rf_run(RsyncFetch_t *rf) {
 							out_pipe[0] = -1;
 							if(close(err_pipe[1]) != -1) {
 								err_pipe[1] = -1;
-								return rf_talk(rf);
+								return rf_mainloop(rf);
 							}
 						}
 					}
