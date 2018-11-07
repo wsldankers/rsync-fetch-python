@@ -1798,6 +1798,9 @@ static rf_status_t rf_recv_filedata(RsyncFetch_t *rf, rf_flist_entry_t *entry) {
 		return RF_STATUS_PYTHON;
 	Py_DecRef(result);
 
+	entry->data_callback = NULL;
+	Py_DecRef(data_callback);
+
 	rf_unblock_threads(rf);
 
 	return RF_STATUS_OK;
@@ -1915,7 +1918,7 @@ static rf_status_t rf_run(RsyncFetch_t *rf) {
 				if(pid == 0) {
 					if(dup2(out_pipe[0], STDIN_FILENO) == -1
 					|| dup2(in_pipe[1], STDOUT_FILENO) == -1
-//					|| dup2(err_pipe[1], STDERR_FILENO) == -1
+					|| dup2(err_pipe[1], STDERR_FILENO) == -1
 					) {
 						perror("dup2");
 						_exit(2);
