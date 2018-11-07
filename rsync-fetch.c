@@ -213,6 +213,7 @@ typedef struct RsyncFetch {
 	rf_flist_entry_t last;
 	size_t multiplex_in_remaining;
 	size_t multiplex_out_remaining;
+	size_t chunk_size;
 	int32_t ndx;
 	int32_t prev_negative_ndx_in;
 	int32_t prev_positive_ndx_in;
@@ -234,6 +235,7 @@ static const RsyncFetch_t RsyncFetch_0 = {
 	.prev_positive_ndx_in = -1,
 	.prev_negative_ndx_out = 1,
 	.prev_positive_ndx_out = -1,
+	.chunk_size = 32768,
 };
 
 struct RsyncFetchObject {
@@ -1706,31 +1708,68 @@ static rf_status_t rf_recv_filedata(RsyncFetch_t *rf, rf_flist_entry_t *entry) {
 	if(!data_callback)
 		return RF_STATUS_PROTO;
 
+	PyObject *bytes = rf->chunk_bytes;
+	size_t size = rf->chunk_size;
+	size_t fill = 0;
+	uint32_t remaining = 0;
+	char *buf = rf->chunk_buffer;
+	if(!bytes || !buf)
+		return RF_STATUS_ASSERT;
+
 	for(;;) {
-		uint32_t len;
-		RF_PROPAGATE_ERROR(rf_recv_uint32(rf, &len));
-		if(!len)
-			break;
-		if(len > MAX_BLOCK_SIZE)
-			return RF_STATUS_PROTO;
-		char *buf = rf->chunk_buffer;
-		if(!buf)
-			return RF_STATUS_ASSERT;
-		RF_PROPAGATE_ERROR(rf_recv_bytes(rf, buf, len));
+		if(!remaining) {
+			RF_PROPAGATE_ERROR(rf_recv_uint32(rf, &remaining));
+			if(!remaining)
+				break;
+		}
 
-		rf_block_threads(rf);
+		size_t avail = size - fill;
+		if(remaining < avail) {
+			RF_PROPAGATE_ERROR(rf_recv_bytes(rf, buf + fill, remaining));
+			fill += remaining;
+			remaining = 0;
+		} else {
+			RF_PROPAGATE_ERROR(rf_recv_bytes(rf, buf + fill, avail));
+			fill = 0; // filled to the brim, actually, but not for long
+			remaining -= avail;
 
-		PyObject *chunk_bytes = rf->chunk_bytes;
-		rf->chunk_buffer = NULL;
-		if(_PyBytes_Resize(&chunk_bytes, len) == -1) {
+			rf_block_threads(rf);
+
+			PyObject *args = PyTuple_Pack(1, bytes);
+			if(!args)
+				return RF_STATUS_PYTHON;
+			// now owned by the args tuple
+			rf->chunk_bytes = NULL;
+
+			PyObject *result = PyObject_CallObject(data_callback, args);
+			Py_DecRef(args);
+			if(!result)
+				return RF_STATUS_PYTHON;
+			Py_DecRef(result);
+
+			// allocate a new buffer for the next chunk (while we still hold the GIL)
+			bytes = PyBytes_FromStringAndSize(NULL, size);
+			if(!bytes)
+				return RF_STATUS_PYTHON;
+			rf->chunk_bytes = bytes;
+			rf->chunk_buffer = PyBytes_AS_STRING(bytes);
+			
+			rf_unblock_threads(rf);
+		}
+	}
+
+	rf_block_threads(rf);
+
+	if(fill) {
+		if(_PyBytes_Resize(&bytes, fill) == -1) {
 			// if this fails the old copy is gone too
 			rf->chunk_bytes = NULL;
 			return RF_STATUS_PYTHON;
 		}
-		PyObject *args = PyTuple_Pack(1, chunk_bytes);
+		PyObject *args = PyTuple_Pack(1, bytes);
+		rf->chunk_bytes = NULL;
 		if(!args) {
-			// might have been moved by _PyBytes_Resize()
-			rf->chunk_bytes = chunk_bytes;
+			Py_DecRef(bytes);
 			return RF_STATUS_PYTHON;
 		}
 		// now owned by the args tuple
@@ -1742,17 +1781,14 @@ static rf_status_t rf_recv_filedata(RsyncFetch_t *rf, rf_flist_entry_t *entry) {
 			return RF_STATUS_PYTHON;
 		Py_DecRef(result);
 
-		// allocate a new one for the next chunk (while we still hold the GIL)
-		chunk_bytes = PyBytes_FromStringAndSize(NULL, MAX_BLOCK_SIZE);
-		if(!chunk_bytes)
+		// allocate a new buffer for the next chunk (while we still hold the GIL)
+		bytes = PyBytes_FromStringAndSize(NULL, size);
+		if(!bytes)
 			return RF_STATUS_PYTHON;
-		rf->chunk_bytes = chunk_bytes;
-		rf->chunk_buffer = PyBytes_AS_STRING(chunk_bytes);
-		
-		rf_unblock_threads(rf);
+		rf->chunk_bytes = bytes;
+		rf->chunk_buffer = PyBytes_AS_STRING(bytes);
 	}
 
-	rf_block_threads(rf);
 	PyObject *args = PyTuple_New(0);
 	if(!args)
 		return RF_STATUS_PYTHON;
@@ -1761,6 +1797,7 @@ static rf_status_t rf_recv_filedata(RsyncFetch_t *rf, rf_flist_entry_t *entry) {
 	if(!result)
 		return RF_STATUS_PYTHON;
 	Py_DecRef(result);
+
 	rf_unblock_threads(rf);
 
 	return RF_STATUS_OK;
@@ -1958,40 +1995,55 @@ static bool rf_status_to_exception(RsyncFetch_t *rf, rf_status_t s) {
 	return false;
 }
 
-static int RsyncFetch_dealloc(PyObject *self) {
-	RsyncFetch_t *rf = RsyncFetch_Check(self, false);
+static void rf_stream_clear(RsyncFetch_t *rf, rf_pipestream_t *stream) {
+	if(stream->fd != -1) {
+		close(stream->fd);
+		stream->fd = -1;
+	}
+	free(stream->buf);
+	stream->buf = NULL;
+}
+
+static void rf_clear(RsyncFetch_t *rf) {
 	if(rf) {
-		rf->magic = 0;
+		rf->closed = true;
 
-		if(rf->in_stream.fd != -1)
-			close(rf->in_stream.fd);
-		free(rf->in_stream.buf);
+		rf_stream_clear(rf, &rf->in_stream);
+		rf_stream_clear(rf, &rf->out_stream);
+		rf_stream_clear(rf, &rf->err_stream);
 
-		if(rf->out_stream.fd != -1)
-			close(rf->out_stream.fd);
-		free(rf->out_stream.buf);
-
-		if(rf->err_stream.fd != -1)
-			close(rf->err_stream.fd);
-		free(rf->err_stream.buf);
-
-		if(rf->pid)
+		if(rf->pid) {
 			while(waitpid(rf->pid, NULL, 0) == -1 && errno == EINTR);
+			rf->pid = 0;
+		}
 
 		rf_flist_entry_clear(rf, &rf->last);
 
-		for(rf_flist_t *next, *flist = rf->flists_head; flist; flist = next) {
-			next = flist->next;
+		for(;;) {
+			rf_flist_t *flist = rf->flists_head;
+			if(!flist)
+				break;
 			rf_flist_free(rf, &flist);
 		}
 
 		free(rf->command);
+		rf->command = NULL;
 		free(rf->filters);
+		rf->filters = NULL;
 
 		rf_block_threads(rf);
-		Py_DecRef(rf->entry_callback);
-		Py_DecRef(rf->error_callback);
-		Py_DecRef(rf->chunk_bytes);
+		Py_CLEAR(rf->entry_callback);
+		Py_CLEAR(rf->error_callback);
+		Py_CLEAR(rf->chunk_bytes);
+	}
+}
+
+static int RsyncFetch_dealloc(PyObject *self) {
+	RsyncFetch_t *rf = RsyncFetch_Check(self, false);
+
+	if(rf) {
+		rf->magic = 0;
+		rf_clear(rf);
 	}
 
 	freefunc tp_free = Py_TYPE(self)->tp_free ?: PyObject_Free;
@@ -2000,11 +2052,32 @@ static int RsyncFetch_dealloc(PyObject *self) {
 	return 0;
 }
 
+static PyObject *RsyncFetch_close(PyObject *self) {
+	RsyncFetch_t *rf = RsyncFetch_Check(self, true);
+	if(!rf)
+		return NULL;
+
+	rf_clear(rf);
+
+	Py_RETURN_NONE;
+}
+
+static PyObject *RsyncFetch_exit(PyObject *self, PyObject *args) {
+	RsyncFetch_t *rf = RsyncFetch_Check(self, false);
+	if(!rf)
+		return NULL;
+
+	rf_clear(rf);
+
+	Py_RETURN_NONE;
+}
+
 static rf_status_t rf_init(RsyncFetch_t *rf, PyObject *args, PyObject *kwargs) {
 	PyObject *entry_callback = NULL, *error_callback = NULL;
 	PyObject *command = NULL, *filters = NULL;
-	static char *keywords[] = { "command", "entry_cb", "error_cb", "filters", NULL };
-	if(!PyArg_ParseTupleAndKeywords(args, kwargs, "|$OOOO:run", keywords,
+	Py_ssize_t chunk_size = rf->chunk_size;
+	static char *keywords[] = { "command", "entry_callback", "error_callback", "filters", "chunk_size", NULL };
+	if(!PyArg_ParseTupleAndKeywords(args, kwargs, "|$OOOOn:run", keywords,
 			&command, &entry_callback, &error_callback, &filters))
 		return RF_STATUS_PYTHON;
 
@@ -2035,6 +2108,13 @@ static rf_status_t rf_init(RsyncFetch_t *rf, PyObject *args, PyObject *kwargs) {
 	if(filters && filters != Py_None)
 		RF_PROPAGATE_ERROR(rf_iterate(rf, filters, &rf->filters, &rf->filters_num));
 
+	if(chunk_size < 1) {
+		PyErr_Format(PyExc_ValueError, "chunk_size must be greater than 0");
+		return RF_STATUS_PYTHON;
+	}
+
+	rf->chunk_size = chunk_size;
+
 	return RF_STATUS_OK;
 }
 
@@ -2053,18 +2133,16 @@ static PyObject *RsyncFetch_new(PyTypeObject *subtype, PyObject *args, PyObject 
 	return NULL;
 }
 
-static PyObject *RsyncFetch_run(PyObject *self, PyObject *args) {
+static PyObject *RsyncFetch_run(PyObject *self) {
 	RsyncFetch_t *rf = RsyncFetch_Check(self, true);
 	if(!rf)
 		return NULL;
 	rf->closed = true;
 
 	Py_CLEAR(rf->chunk_bytes);
-	PyObject *chunk_bytes = PyBytes_FromStringAndSize(NULL, MAX_BLOCK_SIZE);
-	if(!chunk_bytes) {
-		rf->chunk_buffer = NULL;
+	PyObject *chunk_bytes = PyBytes_FromStringAndSize(NULL, rf->chunk_size);
+	if(!chunk_bytes)
 		return NULL;
-	}
 	rf->chunk_bytes = chunk_bytes;
 	rf->chunk_buffer = PyBytes_AS_STRING(chunk_bytes);
 	
@@ -2078,60 +2156,21 @@ static PyObject *RsyncFetch_run(PyObject *self, PyObject *args) {
 		return NULL;
 }
 
-static PyObject *RsyncFetch_readbytes(PyObject *self, PyObject *howmany_obj) {
-	PyErr_Clear();
-	Py_ssize_t howmany = PyNumber_AsSsize_t(howmany_obj, PyExc_OverflowError);
-	if(howmany == -1 && PyErr_Occurred())
-		return NULL;
-	if(howmany < 0)
-		return PyErr_Format(PyExc_ValueError, "cannot read a negative number of bytes");
-
-	RsyncFetch_t *rf = RsyncFetch_Check(self, true);
-	if(!rf)
-		return NULL;
-
-	PyObject *ret = PyBytes_FromStringAndSize(NULL, howmany);
-	if(!ret)
-		return NULL;
-
-	if(rf_status_to_exception(rf, rf_recv_bytes(rf, PyBytes_AsString(ret), howmany)))
-		return ret;
-
-	Py_DecRef(ret);
-	return NULL;
-}
-
-static PyObject *RsyncFetch_writebytes(PyObject *self, PyObject *bytes) {
-	RsyncFetch_t *rf = RsyncFetch_Check(self, true);
-	if(!rf)
-		return NULL;
-
-	char *buf;
-	Py_ssize_t len;
-	if(PyBytes_AsStringAndSize(bytes, &buf, &len) == -1)
-		return NULL;
-
-	if(rf_status_to_exception(rf, rf_send_bytes(rf, buf, len)))
-		Py_RETURN_NONE;
-
-	return NULL;
-}
-
 static PyObject *RsyncFetch_self(PyObject *self, PyObject *args) {
 	Py_IncRef(self);
 	return self;
 }
 
+__attribute__((unused))
 static PyObject *RsyncFetch_none(PyObject *self, PyObject *args) {
 	Py_RETURN_NONE;
 }
 
 static PyMethodDef RsyncFetch_methods[] = {
 	{"__enter__", (PyCFunction)RsyncFetch_self, METH_NOARGS, "return a context manager for 'with'"},
-	{"__exit__", RsyncFetch_none, METH_VARARGS, "callback for 'with' context manager"},
-	{"run", RsyncFetch_run, METH_VARARGS, "perform the rsync action"},
-	{"readbytes", RsyncFetch_readbytes, METH_O, "read some bytes"},
-	{"writebytes", RsyncFetch_writebytes, METH_O, "write some bytes"},
+	{"__exit__", RsyncFetch_exit, METH_VARARGS, "callback for 'with' context manager"},
+	{"close", (PyCFunction)RsyncFetch_close, METH_NOARGS, "close this object"},
+	{"run", (PyCFunction)RsyncFetch_run, METH_NOARGS, "perform the rsync action"},
 	{NULL}
 };
 
@@ -2155,6 +2194,17 @@ static struct PyModuleDef rsync_fetch_module = {
 
 PyMODINIT_FUNC PyInit_rsync_fetch(void) {
 	if(PyType_Ready(&RsyncFetch_type) == -1)
+		return NULL;
+
+	PyObject *dict = ((PyTypeObject *)&RsyncFetch_type)->tp_dict;
+	if(!PyDict_Check(dict))
+		return NULL;
+	PyObject *options = Py_BuildValue("(yyy)", "--server", "--sender", "-lHogDtpre.iLsf");
+	if(!options)
+		return NULL;
+	int r = PyDict_SetItemString(dict, "required_options", options);
+	Py_DecRef(options);
+	if(r == -1)
 		return NULL;
 
 	PyObject *module = PyModule_Create(&rsync_fetch_module);
