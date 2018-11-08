@@ -194,6 +194,7 @@ typedef struct RsyncFetch {
 	uint64_t magic;
 #ifdef WITH_THREAD
 	PyThreadState *py_thread_state;
+	PyThread_type_lock lock;
 #endif
 	PyObject *entry_callback;
 	PyObject *error_callback;
@@ -465,6 +466,25 @@ static rf_status_t rf_iterate(RsyncFetch_t *rf, PyObject *iterable, char ***list
 	Py_DecRef(iterator);
 
 	return s;
+}
+
+static rf_flist_entry_t *rf_flist_get_entry(RsyncFetch_t *rf, rf_flist_t *flist, int32_t ndx) {
+	size_t offset = flist->offset;
+	if(ndx >= offset) {
+		ndx -= offset;
+		size_t size = flist->size;
+		if(ndx < size)
+			return flist->entries[ndx];
+	}
+	return NULL;
+}
+
+static rf_flist_entry_t *rf_find_ndx(RsyncFetch_t *rf, int32_t ndx) {
+	for(rf_flist_t *flist = rf->flists_tail; flist; flist = flist->prev)
+		if(ndx >= flist->offset)
+			return rf_flist_get_entry(rf, flist, ndx);
+
+	return NULL;
 }
 
 #ifndef HAVE_PIPE2
@@ -875,28 +895,34 @@ static rf_status_t rf_recv_bytes(RsyncFetch_t *rf, char *buf, size_t len) {
 					}
 					break;
 				case MSG_IO_ERROR:
-				case MSG_SUCCESS:
-				case MSG_NO_SEND:;
+				case MSG_SUCCESS:;
 					int32_t err;
 					if(multiplex_in_remaining != sizeof err)
 						return RF_STATUS_PROTO;
 					RF_PROPAGATE_ERROR(rf_recv_bytes_raw(rf, (char *)&err, sizeof err));
-
-					PyObject *error_callback = rf->error_callback;
-					if(error_callback) {
-						bool was_unblocked = rf_block_threads(rf);
-						PyObject *args = Py_BuildValue("li", (long)le32(err), channel);
-						if(!args)
-							return RF_STATUS_PYTHON;
-						PyObject *result = PyObject_CallObject(error_callback, args);
-						Py_DecRef(args);
-						if(!result)
-							return RF_STATUS_PYTHON;
-						Py_DecRef(result);
-						if(was_unblocked)
-							rf_unblock_threads(rf);
-//					} else {
-//						fprintf(stderr, "<%d> %ld\n", channel, (long)le32(err));
+					break;
+				case MSG_NO_SEND:
+					if(multiplex_in_remaining != sizeof err)
+						return RF_STATUS_PROTO;
+					RF_PROPAGATE_ERROR(rf_recv_bytes_raw(rf, (char *)&err, sizeof err));
+					rf_flist_entry_t *entry = rf_find_ndx(rf, le32(err));
+					if(entry) {
+						PyObject *data_callback = entry->data_callback;
+						if(data_callback) {
+							bool was_unblocked = rf_block_threads(rf);
+							PyObject *args = PyTuple_New(0);
+							if(!args)
+								return RF_STATUS_PYTHON;
+							PyObject *result = PyObject_CallObject(data_callback, args);
+							Py_DecRef(args);
+							if(!result)
+								return RF_STATUS_PYTHON;
+							Py_DecRef(result);
+							entry->data_callback = NULL;
+							Py_DecRef(data_callback);
+							if(was_unblocked)
+								rf_unblock_threads(rf);
+						}
 					}
 					break;
 				case MSG_NOOP:
@@ -1434,25 +1460,6 @@ static rf_status_t rf_flist_add_entry(RsyncFetch_t *rf, rf_flist_t *flist, rf_fl
 	flist->num = num + 1;
 	
 	return RF_STATUS_OK;
-}
-
-static rf_flist_entry_t *rf_flist_get_entry(RsyncFetch_t *rf, rf_flist_t *flist, int32_t ndx) {
-	size_t offset = flist->offset;
-	if(ndx >= offset) {
-		ndx -= offset;
-		size_t size = flist->size;
-		if(ndx < size)
-			return flist->entries[ndx];
-	}
-	return NULL;
-}
-
-static rf_flist_entry_t *rf_find_ndx(RsyncFetch_t *rf, int32_t ndx) {
-	for(rf_flist_t *flist = rf->flists_tail; flist; flist = flist->prev)
-		if(ndx >= flist->offset)
-			return rf_flist_get_entry(rf, flist, ndx);
-
-	return NULL;
 }
 
 static rf_status_t rf_flist_sort(RsyncFetch_t *rf, rf_flist_t *flist) {
@@ -2047,6 +2054,7 @@ static int RsyncFetch_dealloc(PyObject *self) {
 	if(rf) {
 		rf->magic = 0;
 		rf_clear(rf);
+		PyThread_free_lock(rf->lock);
 	}
 
 	freefunc tp_free = Py_TYPE(self)->tp_free ?: PyObject_Free;
@@ -2055,65 +2063,121 @@ static int RsyncFetch_dealloc(PyObject *self) {
 	return 0;
 }
 
+static PyObject *RsyncFetch_close_locked(RsyncFetch_t *rf) {
+	if(rf->closed)
+		return PyErr_Format(PyExc_RuntimeError, "RsyncFetch object already closed");
+
+	rf->closed = true;
+	rf_clear(rf);
+
+	Py_RETURN_NONE;
+}
+
 static PyObject *RsyncFetch_close(PyObject *self) {
 	RsyncFetch_t *rf = RsyncFetch_Check(self, true);
 	if(!rf)
 		return NULL;
 
+	PyThread_type_lock lock = rf->lock;
+	PyLockStatus have_lock;
+	Py_BEGIN_ALLOW_THREADS
+	have_lock = PyThread_acquire_lock(lock, WAIT_LOCK);
+	Py_END_ALLOW_THREADS
+	if(have_lock != PY_LOCK_ACQUIRED)
+		return PyErr_Format(PyExc_RuntimeError, "unable to acquire lock");
+
+	PyObject *ret = RsyncFetch_close_locked(rf);
+
+	PyThread_release_lock(lock);
+
+	return ret;
+}
+
+static PyObject *RsyncFetch_exit_locked(RsyncFetch_t *rf, PyObject *args) {
+	rf->closed = true;
 	rf_clear(rf);
 
 	Py_RETURN_NONE;
 }
 
 static PyObject *RsyncFetch_exit(PyObject *self, PyObject *args) {
-	RsyncFetch_t *rf = RsyncFetch_Check(self, false);
+	RsyncFetch_t *rf = RsyncFetch_Check(self, true);
 	if(!rf)
 		return NULL;
 
-	rf_clear(rf);
+	PyThread_type_lock lock = rf->lock;
+	PyLockStatus have_lock;
+	Py_BEGIN_ALLOW_THREADS
+	have_lock = PyThread_acquire_lock(lock, WAIT_LOCK);
+	Py_END_ALLOW_THREADS
+	if(have_lock != PY_LOCK_ACQUIRED)
+		return PyErr_Format(PyExc_RuntimeError, "unable to acquire lock");
 
-	Py_RETURN_NONE;
+	PyObject *ret = RsyncFetch_exit_locked(rf, args);
+
+	PyThread_release_lock(lock);
+
+	return ret;
 }
 
-static rf_status_t rf_init(RsyncFetch_t *rf, PyObject *args, PyObject *kwargs) {
+static int RsyncFetch_init_locked(RsyncFetch_t *rf, PyObject *args, PyObject *kwargs) {
+	if(rf->closed) {
+		PyErr_Format(PyExc_RuntimeError, "RsyncFetch object already closed");
+		return -1;
+	}
+
 	PyObject *entry_callback = NULL, *error_callback = NULL;
 	PyObject *command = NULL, *filters = NULL;
 	Py_ssize_t chunk_size = rf->chunk_size;
 	static char *keywords[] = { "command", "entry_callback", "error_callback", "filters", "chunk_size", NULL };
 	if(!PyArg_ParseTupleAndKeywords(args, kwargs, "|$OOOOn:run", keywords,
-			&command, &entry_callback, &error_callback, &filters))
-		return RF_STATUS_PYTHON;
+			&command, &entry_callback, &error_callback, &filters, &chunk_size))
+		return -1;
 
 	if(!command) {
 		PyErr_Format(PyExc_TypeError, "missing command parameter");
-		return RF_STATUS_PYTHON;
+		return -1;
 	}
 
-	RF_PROPAGATE_ERROR(rf_iterate(rf, command, &rf->command, NULL));
+	free(rf->command);
+	rf->command = NULL;
+	if(!rf_status_to_exception(rf, rf_iterate(rf, command, &rf->command, NULL)))
+		return -1;
 
 	if(!entry_callback) {
-		PyErr_Format(PyExc_TypeError, "missing entry_cb parameter");
-		return RF_STATUS_PYTHON;
+		PyErr_Format(PyExc_TypeError, "missing entry_callback parameter");
+		return -1;
 	}
 
-	if(!PyCallable_Check(entry_callback))
-		return RF_STATUS_PYTHON;
+	if(!PyCallable_Check(entry_callback)) {
+		PyErr_Format(PyExc_TypeError, "entry_callback parameter is not callable");
+		return -1;
+	}
 	Py_IncRef(entry_callback);
+	Py_CLEAR(rf->entry_callback);
 	rf->entry_callback = entry_callback;
 
 	if(error_callback && error_callback != Py_None) {
-		if(!PyCallable_Check(error_callback))
-			return RF_STATUS_PYTHON;
+		if(!PyCallable_Check(error_callback)) {
+			PyErr_Format(PyExc_TypeError, "error_callback parameter is not callable");
+			return -1;
+		}
 		Py_IncRef(error_callback);
+		Py_CLEAR(rf->error_callback);
 		rf->error_callback = error_callback;
 	}
 
-	if(filters && filters != Py_None)
-		RF_PROPAGATE_ERROR(rf_iterate(rf, filters, &rf->filters, &rf->filters_num));
+	free(rf->filters);
+	rf->filters = NULL;
+	rf->filters_num = 0;
+	if(filters && filters != Py_None) {
+		if(!rf_status_to_exception(rf, rf_iterate(rf, filters, &rf->filters, &rf->filters_num)))
+			return -1;
+	}
 
 	if(chunk_size < 1) {
 		PyErr_Format(PyExc_ValueError, "chunk_size must be greater than 0");
-		return RF_STATUS_PYTHON;
+		return -1;
 	}
 
 	rf->chunk_size = chunk_size;
@@ -2121,26 +2185,51 @@ static rf_status_t rf_init(RsyncFetch_t *rf, PyObject *args, PyObject *kwargs) {
 	return RF_STATUS_OK;
 }
 
+static int RsyncFetch_init(PyObject *self, PyObject *args, PyObject *kwargs) {
+	RsyncFetch_t *rf = RsyncFetch_Check(self, true);
+	if(!rf)
+		return -1;
+
+	PyThread_type_lock lock = rf->lock;
+	PyLockStatus have_lock;
+	Py_BEGIN_ALLOW_THREADS
+	have_lock = PyThread_acquire_lock(lock, WAIT_LOCK);
+	Py_END_ALLOW_THREADS
+	if(have_lock != PY_LOCK_ACQUIRED) {
+		PyErr_SetString(PyExc_RuntimeError, "unable to acquire lock");
+		return -1;
+	}
+
+	int ret = RsyncFetch_init_locked(rf, args, kwargs);
+
+	PyThread_release_lock(lock);
+
+	return ret;
+}
+
 static PyObject *RsyncFetch_new(PyTypeObject *subtype, PyObject *args, PyObject *kwargs) {
 	struct RsyncFetchObject *obj = PyObject_New(struct RsyncFetchObject, subtype);
 	if(obj) {
 		obj->rf = RsyncFetch_0;
 
-		if(rf_status_to_exception(&obj->rf, rf_init(&obj->rf, args, kwargs)))
+		PyThread_type_lock lock = PyThread_allocate_lock();
+		if(lock) {
+			obj->rf.lock = lock;
 			return &obj->ob_base;
+		}
 
 		RsyncFetch_dealloc(&obj->ob_base);
-
-		return NULL;
 	}
 	return NULL;
 }
 
-static PyObject *RsyncFetch_run(PyObject *self) {
-	RsyncFetch_t *rf = RsyncFetch_Check(self, true);
-	if(!rf)
-		return NULL;
+static PyObject *RsyncFetch_run_locked(RsyncFetch_t *rf) {
+	if(rf->closed)
+		return PyErr_Format(PyExc_RuntimeError, "RsyncFetch object already closed");
 	rf->closed = true;
+
+	if(!rf->entry_callback || !rf->command)
+		return PyErr_Format(PyExc_RuntimeError, "RsyncFetch object not initialized properly");
 
 	Py_CLEAR(rf->chunk_bytes);
 	PyObject *chunk_bytes = PyBytes_FromStringAndSize(NULL, rf->chunk_size);
@@ -2157,6 +2246,26 @@ static PyObject *RsyncFetch_run(PyObject *self) {
 		Py_RETURN_NONE;
 	else
 		return NULL;
+}
+
+static PyObject *RsyncFetch_run(PyObject *self) {
+	RsyncFetch_t *rf = RsyncFetch_Check(self, true);
+	if(!rf)
+		return NULL;
+
+	PyThread_type_lock lock = rf->lock;
+	PyLockStatus have_lock;
+	Py_BEGIN_ALLOW_THREADS
+	have_lock = PyThread_acquire_lock(lock, WAIT_LOCK);
+	Py_END_ALLOW_THREADS
+	if(have_lock != PY_LOCK_ACQUIRED)
+		return PyErr_Format(PyExc_RuntimeError, "unable to acquire lock");
+
+	PyObject *ret = RsyncFetch_run_locked(rf);
+
+	PyThread_release_lock(lock);
+
+	return ret;
 }
 
 static PyObject *RsyncFetch_self(PyObject *self, PyObject *args) {
@@ -2182,7 +2291,8 @@ static PyTypeObject RsyncFetch_type = {
 	.tp_flags = Py_TPFLAGS_DEFAULT,
 	.tp_basicsize = sizeof(struct RsyncFetchObject),
 	.tp_name = "rsync_fetch.RsyncFetch",
-	.tp_new = (newfunc)RsyncFetch_new,
+	.tp_new = RsyncFetch_new,
+	.tp_init = RsyncFetch_init,
 	.tp_dealloc = (destructor)RsyncFetch_dealloc,
 	.tp_methods = RsyncFetch_methods,
 };
