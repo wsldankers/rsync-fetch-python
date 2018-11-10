@@ -915,11 +915,11 @@ static rf_status_t rf_recv_bytes(RsyncFetch_t *rf, char *buf, size_t len) {
 								return RF_STATUS_PYTHON;
 							PyObject *result = PyObject_CallObject(data_callback, args);
 							Py_DecRef(args);
+							entry->data_callback = NULL;
+							Py_DecRef(data_callback);
 							if(!result)
 								return RF_STATUS_PYTHON;
 							Py_DecRef(result);
-							entry->data_callback = NULL;
-							Py_DecRef(data_callback);
 							if(was_unblocked)
 								rf_unblock_threads(rf);
 						}
@@ -1685,15 +1685,15 @@ static rf_status_t rf_recv_flist(RsyncFetch_t *rf) {
 		);
 		if(!args)
 			return RF_STATUS_PYTHON;
-		PyObject *result = PyObject_CallObject(rf->entry_callback, args);
+		PyObject *data_callback = PyObject_CallObject(rf->entry_callback, args);
 		Py_DecRef(args);
-		if(!result)
+		if(!data_callback)
 			return RF_STATUS_PYTHON;
-		if(result == Py_None) {
-			Py_DecRef(result);
+		if(data_callback == Py_None) {
+			Py_DecRef(data_callback);
 		} else {
+			entry->data_callback = data_callback;
 			if(S_ISREG(entry->mode) && !entry->hardlink) {
-				entry->data_callback = result;
 				RF_PROPAGATE_ERROR(rf_send_ndx(rf, offset + i));
 				RF_PROPAGATE_ERROR(rf_send_uint16(rf, ITEM_TRANSFER));
 				RF_PROPAGATE_ERROR(rf_send_uint32(rf, 0)); // number of checksums
@@ -1701,6 +1701,15 @@ static rf_status_t rf_recv_flist(RsyncFetch_t *rf) {
 				RF_PROPAGATE_ERROR(rf_send_uint32(rf, 2)); // checksum length
 				RF_PROPAGATE_ERROR(rf_send_uint32(rf, 0)); // remainder length
 			} else {
+				PyObject *args = PyTuple_New(0);
+				if(!args)
+					return RF_STATUS_PYTHON;
+				PyObject *result = PyObject_CallObject(data_callback, args);
+				Py_DecRef(args);
+				entry->data_callback = NULL;
+				Py_DecRef(data_callback);
+				if(!result)
+					return RF_STATUS_PYTHON;
 				Py_DecRef(result);
 			}
 		}
@@ -1801,12 +1810,11 @@ static rf_status_t rf_recv_filedata(RsyncFetch_t *rf, rf_flist_entry_t *entry) {
 		return RF_STATUS_PYTHON;
 	PyObject *result = PyObject_CallObject(data_callback, args);
 	Py_DecRef(args);
+	entry->data_callback = NULL;
+	Py_DecRef(data_callback);
 	if(!result)
 		return RF_STATUS_PYTHON;
 	Py_DecRef(result);
-
-	entry->data_callback = NULL;
-	Py_DecRef(data_callback);
 
 	rf_unblock_threads(rf);
 
