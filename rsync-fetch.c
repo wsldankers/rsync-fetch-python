@@ -14,6 +14,7 @@
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <sys/uio.h>
+#include <avl.h>
 
 #define PY_SSIZE_T_CLEAN
 
@@ -177,18 +178,23 @@ typedef struct rf_flist_entry {
 static const rf_flist_entry_t rf_flist_entry_0;
 
 typedef struct rf_flist {
-	struct rf_flist *prev;
-	struct rf_flist *next;
+	avl_node_t node;
 	size_t size;
 	size_t num;
 	size_t offset;
 	rf_flist_entry_t **entries;
 } rf_flist_t;
-static const rf_flist_t rf_flist_0;
+static const rf_flist_t rf_flist_0 = { .node = AVL_NODE_INITIALIZER(NULL) };
 
 #define RF_PROPAGATE_ERROR(x) do { rf_status_t __e_##__LINE__ = (x); if(__e_##__LINE__ != RF_STATUS_OK) return __e_##__LINE__; } while(false)
 
 #define RSYNCFETCH_MAGIC UINT64_C(0x6FB32179D3F495D0)
+
+static int rf_flist_cmp(const void *a, const void *b, void *userdata) {
+	size_t offset_a = ((rf_flist_t *)a)->offset;
+	size_t offset_b = ((rf_flist_t *)b)->offset;
+	return AVL_CMP(offset_a, offset_b);
+}
 
 typedef struct RsyncFetch {
 	uint64_t magic;
@@ -203,13 +209,10 @@ typedef struct RsyncFetch {
 	char **command;
 	char **filters;
 	size_t filters_num;
-	rf_flist_t *flists_head;
-	rf_flist_t *flists_tail;
+	avl_tree_t flists;
 	rf_pipestream_t in_stream;
 	rf_pipestream_t out_stream;
 	rf_pipestream_t err_stream;
-	size_t flists_num;
-	size_t flists_size;
 	rf_flist_entry_t last;
 	size_t multiplex_in_remaining;
 	size_t multiplex_out_remaining;
@@ -230,6 +233,7 @@ static const RsyncFetch_t RsyncFetch_0 = {
 	.in_stream = PIPESTREAM_INITIALIZER,
 	.out_stream = PIPESTREAM_INITIALIZER,
 	.err_stream = PIPESTREAM_INITIALIZER,
+	.flists = AVL_TREE_INITIALIZER(rf_flist_cmp, NULL),
 	.ndx = 1,
 	.prev_negative_ndx_in = 1,
 	.prev_positive_ndx_in = -1,
@@ -475,15 +479,17 @@ static rf_flist_entry_t *rf_flist_get_entry(RsyncFetch_t *rf, rf_flist_t *flist,
 		if(ndx < size)
 			return flist->entries[ndx];
 	}
+fprintf(stderr, "%zu %"PRId32"\n", offset, ndx);
 	return NULL;
 }
 
 static rf_flist_entry_t *rf_find_ndx(RsyncFetch_t *rf, int32_t ndx) {
-	for(rf_flist_t *flist = rf->flists_tail; flist; flist = flist->prev)
-		if(ndx >= flist->offset)
-			return rf_flist_get_entry(rf, flist, ndx);
-
-	return NULL;
+	rf_flist_t dummy = rf_flist_0;
+	dummy.offset = ndx;
+	avl_node_t *node = avl_search_right(&rf->flists, &dummy, NULL);
+	if(!node)
+		return NULL;
+	return rf_flist_get_entry(rf, node->item, ndx);
 }
 
 #ifndef HAVE_PIPE2
@@ -617,12 +623,7 @@ static rf_status_t rf_read_error_stream(RsyncFetch_t *rf) {
 		PyObject *error_callback = rf->error_callback;
 		if(error_callback) {
 			rf_block_threads(rf);
-			PyObject *args = Py_BuildValue("(y#)",
-				todo, (Py_ssize_t)(eol - todo));
-			if(!args)
-				return RF_STATUS_PYTHON;
-			PyObject *result = PyObject_CallObject(error_callback, args);
-			Py_DecRef(args);
+			PyObject *result = PyObject_CallFunction(error_callback, "y#", todo, (Py_ssize_t)(eol - todo));
 			if(!result)
 				return RF_STATUS_PYTHON;
 			Py_DecRef(result);
@@ -644,11 +645,7 @@ static rf_status_t rf_read_error_stream(RsyncFetch_t *rf) {
 		PyObject *error_callback = rf->error_callback;
 		if(error_callback) {
 			rf_block_threads(rf);
-			PyObject *args = Py_BuildValue("(y#)", buf, size);
-			if(!args)
-				return RF_STATUS_PYTHON;
-			PyObject *result = PyObject_CallObject(error_callback, args);
-			Py_DecRef(args);
+			PyObject *result = PyObject_CallFunction(error_callback, "y#", buf, size);
 			if(!result)
 				return RF_STATUS_PYTHON;
 			Py_DecRef(result);
@@ -874,13 +871,9 @@ static rf_status_t rf_recv_bytes(RsyncFetch_t *rf, char *buf, size_t len) {
 						PyObject *error_callback = rf->error_callback;
 						if(error_callback) {
 							bool was_unblocked = rf_block_threads(rf);
-							PyObject *args = Py_BuildValue("y#i",
-								message, multiplex_in_remaining, channel);
+							PyObject *result = PyObject_CallFunction(error_callback, "y#i",
+                                message, multiplex_in_remaining, channel);
 							free(message);
-							if(!args)
-								return RF_STATUS_PYTHON;
-							PyObject *result = PyObject_CallObject(error_callback, args);
-							Py_DecRef(args);
 							if(!result)
 								return RF_STATUS_PYTHON;
 							Py_DecRef(result);
@@ -909,11 +902,7 @@ static rf_status_t rf_recv_bytes(RsyncFetch_t *rf, char *buf, size_t len) {
 						PyObject *data_callback = entry->data_callback;
 						if(data_callback) {
 							bool was_unblocked = rf_block_threads(rf);
-							PyObject *args = PyTuple_New(0);
-							if(!args)
-								return RF_STATUS_PYTHON;
-							PyObject *result = PyObject_CallObject(data_callback, args);
-							Py_DecRef(args);
+							PyObject *result = PyObject_CallFunction(data_callback, NULL);
 							entry->data_callback = NULL;
 							Py_DecRef(data_callback);
 							if(!result)
@@ -1397,13 +1386,8 @@ static rf_status_t rf_flist_new(RsyncFetch_t *rf, int32_t offset, rf_flist_t **f
 		return RF_STATUS_ERRNO;
 	*flist = rf_flist_0;
 	flist->offset = offset;
-	rf_flist_t *tail = rf->flists_tail;
-	if(tail)
-		tail->next = flist;
-	else
-		rf->flists_head = flist;
-	rf->flists_tail = flist;
-	flist->prev = tail;
+	flist->node.item = flist;
+	avl_insert_before(&rf->flists, NULL, &flist->node);
 	*flistp = flist;
 	return RF_STATUS_OK;
 }
@@ -1413,16 +1397,7 @@ static void rf_flist_free(RsyncFetch_t *rf, rf_flist_t **flistp) {
 		rf_flist_t *flist = *flistp;
 		if(flist) {
 			bool threads_unblocked = (bool)rf->py_thread_state;
-			rf_flist_t *next = flist->next;
-			rf_flist_t *prev = flist->prev;
-			if(next)
-				next->prev = prev;
-			else
-				rf->flists_tail = prev;
-			if(prev)
-				prev->next = next;
-			else
-				rf->flists_head = next;
+			avl_unlink(&rf->flists, &flist->node);
 			rf_flist_entry_t **entries = flist->entries;
 			if(entries) {
 				size_t num = flist->num;
@@ -1514,13 +1489,15 @@ static rf_status_t rf_fill_flist_entry(RsyncFetch_t *rf, rf_flist_entry_t *entry
 		int32_t hlink;
 		RF_PROPAGATE_ERROR(rf_recv_varint(rf, &hlink));
 
-		rf_flist_t *flist = rf->flists_tail;
+		avl_node_t *node = rf->flists.tail;
+		if(!node)
+			return RF_STATUS_PROTO;
+		rf_flist_t *flist = node->item;
 		if(hlink < flist->offset) {
 			hardlink = rf_find_ndx(rf, hlink);
 			if(!hardlink) {
 				fprintf(stderr, "unable to connect hardlink for %s\n", name);
-				fprintf(stderr, "min_offset = %zu  ndx = %"PRId32"\n", rf->flists_head->offset, hlink);
-				return RF_STATUS_PROTO;
+				fprintf(stderr, "min_offset = %zu  ndx = %"PRId32"\n", ((rf_flist_t *)rf->flists.head->item)->offset, hlink);
 			}
 			RF_PROPAGATE_ERROR(rf_refstring_dup(rf, hardlink->name, &entry->hardlink));
 		} else {
@@ -1674,7 +1651,7 @@ static rf_status_t rf_recv_flist(RsyncFetch_t *rf) {
 		rf_flist_entry_t *entry = entries[i];
 
 		rf_block_threads(rf);
-		PyObject *args = Py_BuildValue("y#LLLLy#Ly#LLy#y#",
+		PyObject *data_callback = PyObject_CallFunction(rf->entry_callback, "y#LLLLy#Ly#LLy#y#",
 			entry->name, rf_refstring_len(entry->name),
 			(long long)entry->size,
 			(long long)entry->mtime,
@@ -1688,10 +1665,6 @@ static rf_status_t rf_recv_flist(RsyncFetch_t *rf) {
 			entry->symlink, rf_refstring_len(entry->symlink),
 			entry->hardlink, rf_refstring_len(entry->hardlink)
 		);
-		if(!args)
-			return RF_STATUS_PYTHON;
-		PyObject *data_callback = PyObject_CallObject(rf->entry_callback, args);
-		Py_DecRef(args);
 		if(!data_callback)
 			return RF_STATUS_PYTHON;
 		if(data_callback == Py_None) {
@@ -1706,11 +1679,7 @@ static rf_status_t rf_recv_flist(RsyncFetch_t *rf) {
 				RF_PROPAGATE_ERROR(rf_send_uint32(rf, 2)); // checksum length
 				RF_PROPAGATE_ERROR(rf_send_uint32(rf, 0)); // remainder length
 			} else {
-				PyObject *args = PyTuple_New(0);
-				if(!args)
-					return RF_STATUS_PYTHON;
-				PyObject *result = PyObject_CallObject(data_callback, args);
-				Py_DecRef(args);
+				PyObject *result = PyObject_CallFunction(data_callback, NULL);
 				entry->data_callback = NULL;
 				Py_DecRef(data_callback);
 				if(!result)
@@ -1756,14 +1725,9 @@ static rf_status_t rf_recv_filedata(RsyncFetch_t *rf, rf_flist_entry_t *entry) {
 
 			rf_block_threads(rf);
 
-			PyObject *args = PyTuple_Pack(1, bytes);
-			if(!args)
-				return RF_STATUS_PYTHON;
-			// now owned by the args tuple
+			PyObject *result = PyObject_CallFunctionObjArgs(data_callback, bytes, NULL);
 			rf->chunk_bytes = NULL;
-
-			PyObject *result = PyObject_CallObject(data_callback, args);
-			Py_DecRef(args);
+			Py_DecRef(bytes);
 			if(!result)
 				return RF_STATUS_PYTHON;
 			Py_DecRef(result);
@@ -1773,7 +1737,7 @@ static rf_status_t rf_recv_filedata(RsyncFetch_t *rf, rf_flist_entry_t *entry) {
 			if(!bytes)
 				return RF_STATUS_PYTHON;
 			rf->chunk_bytes = bytes;
-			rf->chunk_buffer = PyBytes_AS_STRING(bytes);
+			rf->chunk_buffer = buf = PyBytes_AS_STRING(bytes);
 			
 			rf_unblock_threads(rf);
 		}
@@ -1787,17 +1751,10 @@ static rf_status_t rf_recv_filedata(RsyncFetch_t *rf, rf_flist_entry_t *entry) {
 			rf->chunk_bytes = NULL;
 			return RF_STATUS_PYTHON;
 		}
-		PyObject *args = PyTuple_Pack(1, bytes);
-		rf->chunk_bytes = NULL;
-		if(!args) {
-			Py_DecRef(bytes);
-			return RF_STATUS_PYTHON;
-		}
-		// now owned by the args tuple
-		rf->chunk_bytes = NULL;
 
-		PyObject *result = PyObject_CallObject(data_callback, args);
-		Py_DecRef(args);
+		PyObject *result = PyObject_CallFunctionObjArgs(data_callback, bytes, NULL);
+		Py_DecRef(bytes);
+		rf->chunk_bytes = NULL;
 		if(!result)
 			return RF_STATUS_PYTHON;
 		Py_DecRef(result);
@@ -1810,11 +1767,7 @@ static rf_status_t rf_recv_filedata(RsyncFetch_t *rf, rf_flist_entry_t *entry) {
 		rf->chunk_buffer = PyBytes_AS_STRING(bytes);
 	}
 
-	PyObject *args = PyTuple_New(0);
-	if(!args)
-		return RF_STATUS_PYTHON;
-	PyObject *result = PyObject_CallObject(data_callback, args);
-	Py_DecRef(args);
+	PyObject *result = PyObject_CallFunction(data_callback, NULL);
 	entry->data_callback = NULL;
 	Py_DecRef(data_callback);
 	if(!result)
@@ -1857,6 +1810,7 @@ static rf_status_t rf_mainloop(RsyncFetch_t *rf) {
 	RF_PROPAGATE_ERROR(rf_recv_flist(rf));
 
 	int phase = 0;
+	size_t num_flists = 1;
 
 	for(;;) {
 		int32_t ndx;
@@ -1864,9 +1818,12 @@ static rf_status_t rf_mainloop(RsyncFetch_t *rf) {
 		if(ndx == NDX_FLIST_EOF) {
 			// do nothing
 		} else if(ndx == NDX_DONE) {
-			rf_flist_t *flist = rf->flists_head;
-			rf_flist_free(rf, &flist);
-			if(!rf->flists_head) {
+//			rf_flist_t *flist = rf->flists.head->item;
+//			rf_flist_free(rf, &flist);
+			if(num_flists)
+				num_flists--;
+//			if(!rf->flists.head) {
+			if(!num_flists) {
 				phase++;
 				RF_PROPAGATE_ERROR(rf_send_ndx(rf, NDX_DONE));
 			}
@@ -1904,6 +1861,7 @@ static rf_status_t rf_mainloop(RsyncFetch_t *rf) {
 			RF_PROPAGATE_ERROR(rf_recv_bytes(rf, md5, sizeof md5));
 		} else {
 			// ndx = NDX_FLIST_OFFSET - ndx
+			num_flists++;
 			RF_PROPAGATE_ERROR(rf_recv_flist(rf));
 		}
 	}
@@ -2043,9 +2001,10 @@ static void rf_clear(RsyncFetch_t *rf) {
 		rf_flist_entry_clear(rf, &rf->last);
 
 		for(;;) {
-			rf_flist_t *flist = rf->flists_head;
-			if(!flist)
+			avl_node_t *node = rf->flists.head;
+			if(!node)
 				break;
+			rf_flist_t *flist = node->item;
 			rf_flist_free(rf, &flist);
 		}
 
