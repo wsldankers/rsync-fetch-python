@@ -1183,7 +1183,7 @@ static rf_status_t rf_recv_varlong(RsyncFetch_t *rf, size_t min_bytes, int64_t *
 			return RF_STATUS_PROTO;
 		RF_PROPAGATE_ERROR(rf_recv_bytes(rf, (char *)init_bytes + min_bytes, extra));
 	}
-	extra_bytes[total_bytes] = init_bytes[0] & ((1 << (8 - extra)) - 1);
+	init_bytes[total_bytes] = init_bytes[0] & ((1 << (8 - extra)) - 1);
 	int64_t v = 0;
 	for(int i = 0; i <= total_bytes; i++)
 		v |= extra_bytes[i] << (8 * i);
