@@ -1181,7 +1181,7 @@ static rf_status_t rf_recv_varlong(RsyncFetch_t *rf, size_t min_bytes, int64_t *
 	if(extra) {
 		if(total_bytes >= sizeof(int64_t))
 			return RF_STATUS_PROTO;
-		RF_PROPAGATE_ERROR(rf_recv_bytes(rf, (char *)extra_bytes + min_bytes, extra));
+		RF_PROPAGATE_ERROR(rf_recv_bytes(rf, (char *)init_bytes + min_bytes, extra));
 	}
 	extra_bytes[total_bytes] = init_bytes[0] & ((1 << (8 - extra)) - 1);
 	int64_t v = 0;
@@ -2109,7 +2109,7 @@ static PyObject *RsyncFetch_exit_locked(RsyncFetch_t *rf, PyObject *args) {
 }
 
 static PyObject *RsyncFetch_exit(PyObject *self, PyObject *args) {
-	RsyncFetch_t *rf = RsyncFetch_Check(self, true);
+	RsyncFetch_t *rf = RsyncFetch_Check(self, false);
 	if(!rf)
 		return NULL;
 
