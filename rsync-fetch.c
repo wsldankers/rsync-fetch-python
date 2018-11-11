@@ -203,7 +203,6 @@ typedef struct RsyncFetch {
 	char **command;
 	char **filters;
 	size_t filters_num;
-	rf_flist_t *flist;
 	rf_flist_t *flists_head;
 	rf_flist_t *flists_tail;
 	rf_pipestream_t in_stream;
@@ -1515,12 +1514,19 @@ static rf_status_t rf_fill_flist_entry(RsyncFetch_t *rf, rf_flist_entry_t *entry
 		int32_t hlink;
 		RF_PROPAGATE_ERROR(rf_recv_varint(rf, &hlink));
 
-		rf_flist_t *flist = rf->flist;
+		rf_flist_t *flist = rf->flists_tail;
 		if(hlink < flist->offset) {
 			hardlink = rf_find_ndx(rf, hlink);
+			if(!hardlink) {
+				fprintf(stderr, "unable to connect hardlink for %s\n", name);
+				fprintf(stderr, "min_offset = %zu  ndx = %"PRId32"\n", rf->flists_head->offset, hlink);
+				return RF_STATUS_PROTO;
+			}
 			RF_PROPAGATE_ERROR(rf_refstring_dup(rf, hardlink->name, &entry->hardlink));
 		} else {
 			hardlink = rf_flist_get_entry(rf, flist, hlink);
+			if(!hardlink)
+				return RF_STATUS_PROTO;
 
 			entry->size = hardlink->size;
 			uint32_t mode = entry->mode = hardlink->mode;
@@ -1652,7 +1658,6 @@ static rf_status_t rf_recv_flist_entry(RsyncFetch_t *rf, rf_flist_entry_t **entr
 static rf_status_t rf_recv_flist(RsyncFetch_t *rf) {
 	rf_flist_t *flist;
 	RF_PROPAGATE_ERROR(rf_flist_new(rf, rf->ndx, &flist));
-	rf->flist = flist;
 	for(;;) {
 		rf_flist_entry_t *entry;
 		RF_PROPAGATE_ERROR(rf_recv_flist_entry(rf, &entry));
