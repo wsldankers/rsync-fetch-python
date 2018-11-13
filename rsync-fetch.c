@@ -1646,53 +1646,73 @@ static rf_status_t rf_recv_flist(RsyncFetch_t *rf) {
 			break;
 		RF_PROPAGATE_ERROR(rf_flist_add_entry(rf, flist, entry));
 	}
-	RF_PROPAGATE_ERROR(rf_flist_sort(rf, flist));
-	rf->ndx++;
 	size_t num = flist->num;
-	size_t offset = flist->offset;
-	rf_flist_entry_t **entries = flist->entries;
-	for(size_t i = 0; i < num; i++) {
-		rf_flist_entry_t *entry = entries[i];
-
-		rf_block_threads(rf);
-		PyObject *data_callback = PyObject_CallFunction(rf->entry_callback, "y#LLLLy#Ly#LLy#y#",
-			entry->name, rf_refstring_len(entry->name),
-			(long long)entry->size,
-			(long long)entry->mtime,
-			(long long)entry->mode,
-			(long long)entry->uid,
-			entry->user, rf_refstring_len(entry->user),
-			(long long)entry->gid,
-			entry->group, rf_refstring_len(entry->group),
-			(long long)entry->major,
-			(long long)entry->minor,
-			entry->symlink, rf_refstring_len(entry->symlink),
-			entry->hardlink, rf_refstring_len(entry->hardlink)
-		);
-		if(!data_callback)
-			return RF_STATUS_PYTHON;
-		if(data_callback == Py_None) {
-			Py_DecRef(data_callback);
-		} else {
-			entry->data_callback = data_callback;
-			if(S_ISREG(entry->mode) && !entry->hardlink) {
-				RF_PROPAGATE_ERROR(rf_send_ndx(rf, offset + i));
-				RF_PROPAGATE_ERROR(rf_send_uint16(rf, ITEM_TRANSFER));
-				RF_PROPAGATE_ERROR(rf_send_uint32(rf, 0)); // number of checksums
-				RF_PROPAGATE_ERROR(rf_send_uint32(rf, MAX_BLOCK_SIZE)); // block length
-				RF_PROPAGATE_ERROR(rf_send_uint32(rf, 2)); // checksum length
-				RF_PROPAGATE_ERROR(rf_send_uint32(rf, 0)); // remainder length
+	rf->ndx++;
+	if(num) {
+		rf_flist_entry_t **entries;
+		if(num != flist->size) {
+			entries = realloc(flist->entries, num * sizeof *entries);
+			if(entries) {
+				flist->entries = entries;
+				flist->size = num;
 			} else {
-				PyObject *result = PyObject_CallFunction(data_callback, NULL);
-				entry->data_callback = NULL;
+				// should really just raise RF_STATUS_ERRNO
+				entries = flist->entries;
+			}
+		} else {
+			entries = flist->entries;
+		}
+
+		RF_PROPAGATE_ERROR(rf_flist_sort(rf, flist));
+
+		size_t offset = flist->offset;
+		for(size_t i = 0; i < num; i++) {
+			rf_flist_entry_t *entry = entries[i];
+
+			rf_block_threads(rf);
+			PyObject *data_callback = PyObject_CallFunction(rf->entry_callback, "y#LLLLy#Ly#LLy#y#",
+				entry->name, rf_refstring_len(entry->name),
+				(long long)entry->size,
+				(long long)entry->mtime,
+				(long long)entry->mode,
+				(long long)entry->uid,
+				entry->user, rf_refstring_len(entry->user),
+				(long long)entry->gid,
+				entry->group, rf_refstring_len(entry->group),
+				(long long)entry->major,
+				(long long)entry->minor,
+				entry->symlink, rf_refstring_len(entry->symlink),
+				entry->hardlink, rf_refstring_len(entry->hardlink)
+			);
+			if(!data_callback)
+				return RF_STATUS_PYTHON;
+			if(data_callback == Py_None) {
 				Py_DecRef(data_callback);
-				if(!result)
-					return RF_STATUS_PYTHON;
-				Py_DecRef(result);
+			} else {
+				entry->data_callback = data_callback;
+				if(S_ISREG(entry->mode) && !entry->hardlink) {
+					RF_PROPAGATE_ERROR(rf_send_ndx(rf, offset + i));
+					RF_PROPAGATE_ERROR(rf_send_uint16(rf, ITEM_TRANSFER));
+					RF_PROPAGATE_ERROR(rf_send_uint32(rf, 0)); // number of checksums
+					RF_PROPAGATE_ERROR(rf_send_uint32(rf, MAX_BLOCK_SIZE)); // block length
+					RF_PROPAGATE_ERROR(rf_send_uint32(rf, 2)); // checksum length
+					RF_PROPAGATE_ERROR(rf_send_uint32(rf, 0)); // remainder length
+				} else {
+					PyObject *result = PyObject_CallFunction(data_callback, NULL);
+					entry->data_callback = NULL;
+					Py_DecRef(data_callback);
+					if(!result)
+						return RF_STATUS_PYTHON;
+					Py_DecRef(result);
+				}
 			}
 		}
+		rf_unblock_threads(rf);
+	} else {
+		free(flist->entries);
+		flist->entries = NULL;
 	}
-	rf_unblock_threads(rf);
+
 	RF_PROPAGATE_ERROR(rf_send_ndx(rf, NDX_DONE));
 	return RF_STATUS_OK;
 }
