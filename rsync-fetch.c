@@ -214,6 +214,7 @@ typedef struct RsyncFetch {
 	rf_pipestream_t out_stream;
 	rf_pipestream_t err_stream;
 	rf_flist_entry_t last;
+	uint64_t timeout;
 	size_t multiplex_in_remaining;
 	size_t multiplex_out_remaining;
 	size_t chunk_size;
@@ -240,6 +241,7 @@ static const RsyncFetch_t RsyncFetch_0 = {
 	.prev_negative_ndx_out = 1,
 	.prev_positive_ndx_out = -1,
 	.chunk_size = 32768,
+	.timeout = UINT64_C(30000000000),
 };
 
 struct RsyncFetchObject {
@@ -697,6 +699,7 @@ static rf_status_t rf_recv_bytes_raw(RsyncFetch_t *rf, char *dst, size_t len) {
 		int fd = stream->fd;
 		int out_fd = out_stream->fd;
 		int err_fd = err_stream->fd;
+		int timeout = rf->timeout / UINT64_C(1000000);
 
 		for(;;) {
 			struct pollfd pfds[3] = {
@@ -705,7 +708,7 @@ static rf_status_t rf_recv_bytes_raw(RsyncFetch_t *rf, char *dst, size_t len) {
 				{ .fd = err_fd, .events = POLLIN },
 			};
 
-			int r = poll(pfds, orz(pfds), 500);
+			int r = poll(pfds, orz(pfds), timeout);
 			if(r == -1)
 				return RF_STATUS_ERRNO;
 			if(r == 0)
@@ -780,6 +783,7 @@ static rf_status_t rf_wait_for_eof(RsyncFetch_t *rf) {
 	int fd = stream->fd;
 	int out_fd = out_stream->fd;
 	int err_fd = err_stream->fd;
+	int timeout = rf->timeout / UINT64_C(1000000);
 
 	for(;;) {
 		if(stream->fill)
@@ -791,7 +795,7 @@ static rf_status_t rf_wait_for_eof(RsyncFetch_t *rf) {
 			{ .fd = err_fd, .events = POLLIN },
 		};
 
-		int r = poll(pfds, orz(pfds), 500);
+		int r = poll(pfds, orz(pfds), timeout);
 		if(r == -1)
 			return RF_STATUS_ERRNO;
 		if(r == 0)
@@ -2101,9 +2105,10 @@ static int RsyncFetch_init_locked(RsyncFetch_t *rf, PyObject *args, PyObject *kw
 	PyObject *entry_callback = NULL, *error_callback = NULL;
 	PyObject *command = NULL, *filters = NULL;
 	Py_ssize_t chunk_size = rf->chunk_size;
-	static char *keywords[] = { "command", "entry_callback", "error_callback", "filters", "chunk_size", NULL };
-	if(!PyArg_ParseTupleAndKeywords(args, kwargs, "|$OOOOn:run", keywords,
-			&command, &entry_callback, &error_callback, &filters, &chunk_size))
+	unsigned long long timeout = rf->timeout;
+	static char *keywords[] = { "command", "entry_callback", "error_callback", "filters", "chunk_size", "timeout", NULL };
+	if(!PyArg_ParseTupleAndKeywords(args, kwargs, "|$OOOOnK:run", keywords,
+			&command, &entry_callback, &error_callback, &filters, &chunk_size, &timeout))
 		return -1;
 
 	if(!command) {
@@ -2153,6 +2158,8 @@ static int RsyncFetch_init_locked(RsyncFetch_t *rf, PyObject *args, PyObject *kw
 	}
 
 	rf->chunk_size = chunk_size;
+
+	rf->timeout = timeout;
 
 	return RF_STATUS_OK;
 }
