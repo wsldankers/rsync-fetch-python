@@ -207,6 +207,7 @@ typedef struct RsyncFetch {
 	PyObject *chunk_bytes;
 	char *chunk_buffer;
 	char **command;
+	char **environ;
 	char **filters;
 	size_t filters_num;
 	avl_tree_t flists;
@@ -1944,8 +1945,14 @@ static rf_status_t rf_run(RsyncFetch_t *rf) {
 #endif
 
 					char **command = rf->command;
-					execvp(command[0], command);
-					perror("execvp");
+					char **environ = rf->environ;
+					if(environ) {
+						execvpe(command[0], command, environ);
+						perror("execvpe");
+					} else {
+						execvp(command[0], command);
+						perror("execvp");
+					}
 					_exit(2);
 				} else if(pid != -1) {
 					rf->pid = pid;
@@ -2034,6 +2041,8 @@ static void rf_clear(RsyncFetch_t *rf) {
 
 		free(rf->command);
 		rf->command = NULL;
+		free(rf->environ);
+		rf->environ = NULL;
 		free(rf->filters);
 		rf->filters = NULL;
 
@@ -2123,12 +2132,12 @@ static int RsyncFetch_init_locked(RsyncFetch_t *rf, PyObject *args, PyObject *kw
 	}
 
 	PyObject *entry_callback = NULL, *error_callback = NULL;
-	PyObject *command = NULL, *filters = NULL;
+	PyObject *command = NULL, *environ = NULL, *filters = NULL;
 	Py_ssize_t chunk_size = rf->chunk_size;
 	unsigned long long timeout = rf->timeout;
-	static char *keywords[] = { "command", "entry_callback", "error_callback", "filters", "chunk_size", "timeout", NULL };
-	if(!PyArg_ParseTupleAndKeywords(args, kwargs, "|$OOOOnK:run", keywords,
-			&command, &entry_callback, &error_callback, &filters, &chunk_size, &timeout))
+	static char *keywords[] = { "command", "environ", "entry_callback", "error_callback", "filters", "chunk_size", "timeout", NULL };
+	if(!PyArg_ParseTupleAndKeywords(args, kwargs, "|$OOOOOnK:run", keywords,
+			&command, &environ, &entry_callback, &error_callback, &filters, &chunk_size, &timeout))
 		return -1;
 
 	if(!command) {
@@ -2140,6 +2149,13 @@ static int RsyncFetch_init_locked(RsyncFetch_t *rf, PyObject *args, PyObject *kw
 	rf->command = NULL;
 	if(!rf_status_to_exception(rf, rf_iterate(rf, command, &rf->command, NULL)))
 		return -1;
+
+	free(rf->environ);
+	rf->environ = NULL;
+	if(environ) {
+		if(!rf_status_to_exception(rf, rf_iterate(rf, environ, &rf->environ, NULL)))
+			return -1;
+	}
 
 	if(!entry_callback) {
 		PyErr_Format(PyExc_TypeError, "missing entry_callback parameter");
