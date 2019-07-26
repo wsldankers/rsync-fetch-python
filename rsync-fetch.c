@@ -71,6 +71,7 @@ typedef struct rf_pipestream {
 	int fd;
 } rf_pipestream_t;
 #define PIPESTREAM_INITIALIZER {.fd = -1}
+__attribute__((unused))
 static const rf_pipestream_t rf_pipestream_0 = PIPESTREAM_INITIALIZER;
 
 #define RF_STREAM_IN_BUFSIZE 65536
@@ -482,7 +483,7 @@ static rf_flist_entry_t *rf_flist_get_entry(RsyncFetch_t *rf, rf_flist_t *flist,
 		if(ndx < size)
 			return flist->entries[ndx];
 	}
-fprintf(stderr, "%zu %"PRId32"\n", offset, ndx);
+//fprintf(stderr, "%zu %"PRId32"\n", offset, ndx);
 	return NULL;
 }
 
@@ -1155,7 +1156,7 @@ static rf_status_t rf_recv_varint(RsyncFetch_t *rf, int32_t *d) {
 		extra_bytes[extra] = init & ((1 << (8 - extra)) - 1);
 		int32_t v = 0;
 		for(int i = 0; i <= extra; i++)
-			v |= extra_bytes[i] << (8 * i);
+			v |= (int32_t)extra_bytes[i] << (8 * i);
 		*d = v;
 	} else {
 		*d = init;
@@ -1179,7 +1180,7 @@ static rf_status_t rf_recv_varlong(RsyncFetch_t *rf, size_t min_bytes, int64_t *
 	init_bytes[total_bytes] = init_bytes[0] & ((1 << (8 - extra)) - 1);
 	int64_t v = 0;
 	for(int i = 0; i <= total_bytes; i++)
-		v |= extra_bytes[i] << (8 * i);
+		v |= (int64_t)extra_bytes[i] << (8 * i);
 	*d = v;
 	return RF_STATUS_OK;
 }
@@ -1209,7 +1210,7 @@ static rf_status_t rf_recv_ndx(RsyncFetch_t *rf, int32_t *d) {
 			extra_bytes[sizeof extra_bytes - 1] = init & 0x7F;
 			ndx = 0;
 			for(int i = 0; i < sizeof extra_bytes; i++)
-				ndx |= extra_bytes[i] << (8 * i);
+				ndx |= (int32_t)extra_bytes[i] << (8 * i);
 		} else {
 			uint8_t onemorebyte;
 			RF_PROPAGATE_ERROR(rf_recv_uint8(rf, &onemorebyte));
