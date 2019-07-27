@@ -1246,7 +1246,7 @@ static rf_status_t rf_send_ndx(RsyncFetch_t *rf, int32_t ndx) {
 		return rf_send_uint8(rf, diff);
 	} else {
 		RF_PROPAGATE_ERROR(rf_send_uint8(rf, UINT8_C(0xFE)));
-		if(diff < 0 || diff > 0x7FFFF) {
+		if(diff < 0 || diff > 0x7FFF) {
 			RF_PROPAGATE_ERROR(rf_send_uint8(rf, (ndx >> 24) | UINT8_C(0x80)));
 			RF_PROPAGATE_ERROR(rf_send_uint8(rf, ndx));
 			RF_PROPAGATE_ERROR(rf_send_uint8(rf, ndx >> 8));
