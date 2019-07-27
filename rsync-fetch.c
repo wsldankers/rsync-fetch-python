@@ -730,7 +730,7 @@ static rf_status_t rf_recv_bytes_raw(RsyncFetch_t *rf, char *dst, size_t len) {
 				err_stream->fd = err_fd = -1;
 			}
 
-			if(pfds[RF_STREAM_ERR].revents & POLLOUT) {
+			if(pfds[RF_STREAM_ERR].revents & POLLIN) {
 				RF_PROPAGATE_ERROR(rf_read_error_stream(rf));
 				continue;
 			}
