@@ -187,7 +187,10 @@ typedef struct rf_flist {
 } rf_flist_t;
 static const rf_flist_t rf_flist_0 = { .node = AVL_NODE_INITIALIZER(NULL) };
 
-#define RF_PROPAGATE_ERROR(x) do { rf_status_t __e_##__LINE__ = (x); if(__e_##__LINE__ != RF_STATUS_OK) return __e_##__LINE__; } while(false)
+#define RF_PROPAGATE_ERROR(x) do { rf_status_t __rf_propagate_error = (x); if(__rf_propagate_error != RF_STATUS_OK) return __rf_propagate_error; } while(false)
+//define RF_PROPAGATE_ERROR(x) do { rf_status_t __rf_propagate_error = (x); if(__rf_propagate_error != RF_STATUS_OK) { if(__rf_propagate_error == RF_STATUS_PROTO) fprintf(stderr, "%s:%d: protocol error propagated by %s()\n", __FILE__, __LINE__, __func__); return __rf_propagate_error; } } while(false)
+
+//define RF_RETURN_ERROR(x) do { rf_status_t __rf_return_error = (x); if(__rf_return_error == RF_STATUS_PROTO) fprintf(stderr, "%s:%d: protocol error returned by %s()\n", __FILE__, __LINE__, __func__); return __rf_return_error; } while(false)
 
 #define RSYNCFETCH_MAGIC UINT64_C(0x6FB32179D3F495D0)
 
@@ -1622,6 +1625,13 @@ static rf_status_t rf_recv_flist_entry(RsyncFetch_t *rf, rf_flist_entry_t **entr
 	if(xflags & XMIT_EXTENDED_FLAGS) {
 		RF_PROPAGATE_ERROR(rf_recv_uint8(rf, &b));
 		xflags |= (uint16_t)b << 8;
+
+		if(xflags == (XMIT_EXTENDED_FLAGS | XMIT_IO_ERROR_ENDLIST)) {
+			int32_t err;
+			RF_PROPAGATE_ERROR(rf_recv_varint(rf, &err));
+			// we ignore all numerical errors anyway
+			return *entryp = NULL, RF_STATUS_OK;
+		}
 	}
 
 	rf_flist_entry_t *entry = malloc(sizeof *entry);
@@ -1716,6 +1726,7 @@ static rf_status_t rf_recv_flist(RsyncFetch_t *rf) {
 	}
 
 	RF_PROPAGATE_ERROR(rf_send_ndx(rf, NDX_DONE));
+
 	return RF_STATUS_OK;
 }
 
