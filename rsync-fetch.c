@@ -308,24 +308,25 @@ static inline size_t rf_refstring_len(const char *str) {
 	return str ? ((struct refstring_header *)str)[-1].len : 0;
 }
 
-static rf_status_t rf_refstring_newlen(RsyncFetch_t *rf, const char *str, size_t len, char **strp) {
+static rf_status_t rf_refstring_newlen(RsyncFetch_t *rf, const char *src, size_t len, char **strp) {
 	struct refstring_header *h = malloc(sizeof *h + len + 1);
 	if(!h)
 		return RF_STATUS_ERRNO;
-	if(str)
-		memcpy(h + 1, str, len);
-	((char *)(h + 1))[len] = '\0';
 	h->len = len;
 	h->refcount = 1;
-	return *strp = (char *)(h + 1), RF_STATUS_OK;
+	char *str = (char *)(h + 1);
+	if(src)
+		memcpy(str, src, len);
+	str[len] = '\0';
+	return *strp = str, RF_STATUS_OK;
 }
 
 __attribute__((unused))
-static rf_status_t rf_refstring_new(RsyncFetch_t *rf, const char *str, char **strp) {
-	if(str)
-		return rf_refstring_newlen(rf, str, strlen(str), strp);
+static rf_status_t rf_refstring_new(RsyncFetch_t *rf, const char *src, char **strp) {
+	if(src)
+		return rf_refstring_newlen(rf, src, strlen(src), strp);
 	else
-		return RF_STATUS_OK;
+		return *strp = NULL, RF_STATUS_OK;
 }
 
 static rf_status_t rf_refstring_free(RsyncFetch_t *rf, char **strp) {
