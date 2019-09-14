@@ -2,14 +2,24 @@ Source: rsync-fetch-python
 Section: python
 Priority: optional
 Maintainer: Wessel Dankers <wsl@fruit.je>
-Build-Depends: debhelper (>= 7), dh-python, python3-dev, libavl-dev (>= 2)
+Build-Depends: debhelper, dh-python, python3-dev, libavl-dev (>= 2)
 Standards-Version: 3.7.2
 X-Python3-Version: >= 3.5
 
 Package: python3-rsync-fetch
 Architecture: any
-Depends: ${python3:Depends}, ${shlibs:Depends}
+Depends: ${python3:Depends}, ${shlibs:Depends}, ${misc:Depends}
 Description: Fetch files using rsync
  Implements just enough of the rsync protocol to fetch
  files (and other directory entries). Not intended to be
  a complete implementation of the rsync protocol.
+
+Package: python3-rsync-fetch-dbg
+Architecture: any
+Depends: ${python3:Depends}, ${shlibs:Depends}, ${misc:Depends}
+Description: Fetch files using rsync
+ Implements just enough of the rsync protocol to fetch
+ files (and other directory entries). Not intended to be
+ a complete implementation of the rsync protocol.
+ .
+ This package contains the debug version.
