@@ -205,6 +205,8 @@ typedef struct RsyncFetch {
 #ifdef WITH_THREAD
 	PyThreadState *py_thread_state;
 	PyThread_type_lock lock;
+#else
+	bool py_thread_state;
 #endif
 	PyObject *entry_callback;
 	PyObject *error_callback;
@@ -292,10 +294,48 @@ static inline bool rf_block_threads(RsyncFetch_t *rf) {
 	return false;
 }
 
+static bool rf_acquire_lock(RsyncFetch_t *rf) {
+	PyThread_type_lock lock = rf->lock;
+	PyLockStatus have_lock;
+	Py_BEGIN_ALLOW_THREADS
+	have_lock = PyThread_acquire_lock(lock, WAIT_LOCK);
+	Py_END_ALLOW_THREADS
+	if(have_lock != PY_LOCK_ACQUIRED) {
+		PyErr_Format(PyExc_RuntimeError, "unable to acquire lock");
+		return false;
+	}
+	return true;
+}
+
+static inline void rf_release_lock(RsyncFetch_t *rf) {
+	PyThread_release_lock(rf->lock);
+}
+
 #else
 
-static void rf_block_threads(RsyncFetch_t *rf) {}
-static void rf_unblock_threads(RsyncFetch_t *rf) {}
+static inline bool rf_block_threads(RsyncFetch_t *rf) {
+	if(rf->py_thread_state) {
+		return false;
+	} else {
+		rf->py_thread_state = true;
+		return true;
+	}
+}
+
+static inline bool rf_unblock_threads(RsyncFetch_t *rf) {
+	if(rf->py_thread_state) {
+		rf->py_thread_state = false;
+		return true;
+	} else {
+		return false;
+	}
+}
+
+static inline bool rf_acquire_lock(RsyncFetch_t *rf) {
+	return true;
+}
+
+static inline void rf_release_lock(RsyncFetch_t *rf) {}
 
 #endif
 
@@ -1745,6 +1785,8 @@ static rf_status_t rf_recv_filedata(RsyncFetch_t *rf, rf_flist_entry_t *entry) {
 		return RF_STATUS_ASSERT;
 
 	for(;;) {
+		rf_unblock_threads(rf);
+
 		if(!remaining) {
 			RF_PROPAGATE_ERROR(rf_recv_uint32(rf, &remaining));
 			if(!remaining)
@@ -1776,8 +1818,6 @@ static rf_status_t rf_recv_filedata(RsyncFetch_t *rf, rf_flist_entry_t *entry) {
 				return RF_STATUS_PYTHON;
 			rf->chunk_bytes = bytes;
 			rf->chunk_buffer = buf = PyBytes_AS_STRING(bytes);
-			
-			rf_unblock_threads(rf);
 		}
 	}
 
@@ -2003,17 +2043,17 @@ static bool rf_status_to_exception(RsyncFetch_t *rf, rf_status_t s) {
 		case RF_STATUS_PYTHON:
 			break;
 		case RF_STATUS_TIMEOUT:
-			return PyErr_Format(PyExc_RuntimeError, "operation timed out");
+			PyErr_Format(PyExc_RuntimeError, "operation timed out");
 			break;
 		case RF_STATUS_HANGUP:
-			return PyErr_Format(PyExc_RuntimeError, "rsync process exited prematurely");
+			PyErr_Format(PyExc_RuntimeError, "rsync process exited prematurely");
 			break;
 		case RF_STATUS_PROTO:
-			return PyErr_Format(PyExc_RuntimeError, "protocol error");
+			PyErr_Format(PyExc_RuntimeError, "protocol error");
 			break;
 		default:
 		case RF_STATUS_ASSERT:
-			return PyErr_Format(PyExc_RuntimeError, "internal error");
+			PyErr_Format(PyExc_RuntimeError, "internal error");
 			break;
 	}
 	rf->failed = true;
@@ -2072,7 +2112,9 @@ static int RsyncFetch_dealloc(PyObject *self) {
 	if(rf) {
 		rf->magic = 0;
 		rf_clear(rf);
+#ifdef WITH_THREAD
 		PyThread_free_lock(rf->lock);
+#endif
 	}
 
 	freefunc tp_free = Py_TYPE(self)->tp_free ?: PyObject_Free;
@@ -2096,17 +2138,12 @@ static PyObject *RsyncFetch_close(PyObject *self) {
 	if(!rf)
 		return NULL;
 
-	PyThread_type_lock lock = rf->lock;
-	PyLockStatus have_lock;
-	Py_BEGIN_ALLOW_THREADS
-	have_lock = PyThread_acquire_lock(lock, WAIT_LOCK);
-	Py_END_ALLOW_THREADS
-	if(have_lock != PY_LOCK_ACQUIRED)
-		return PyErr_Format(PyExc_RuntimeError, "unable to acquire lock");
+	if(!rf_acquire_lock(rf))
+		return NULL;
 
 	PyObject *ret = RsyncFetch_close_locked(rf);
 
-	PyThread_release_lock(lock);
+	rf_release_lock(rf);
 
 	return ret;
 }
@@ -2123,17 +2160,12 @@ static PyObject *RsyncFetch_exit(PyObject *self, PyObject *args) {
 	if(!rf)
 		return NULL;
 
-	PyThread_type_lock lock = rf->lock;
-	PyLockStatus have_lock;
-	Py_BEGIN_ALLOW_THREADS
-	have_lock = PyThread_acquire_lock(lock, WAIT_LOCK);
-	Py_END_ALLOW_THREADS
-	if(have_lock != PY_LOCK_ACQUIRED)
-		return PyErr_Format(PyExc_RuntimeError, "unable to acquire lock");
+	if(!rf_acquire_lock(rf))
+		return NULL;
 
 	PyObject *ret = RsyncFetch_exit_locked(rf, args);
 
-	PyThread_release_lock(lock);
+	rf_release_lock(rf);
 
 	return ret;
 }
@@ -2218,19 +2250,12 @@ static int RsyncFetch_init(PyObject *self, PyObject *args, PyObject *kwargs) {
 	if(!rf)
 		return -1;
 
-	PyThread_type_lock lock = rf->lock;
-	PyLockStatus have_lock;
-	Py_BEGIN_ALLOW_THREADS
-	have_lock = PyThread_acquire_lock(lock, WAIT_LOCK);
-	Py_END_ALLOW_THREADS
-	if(have_lock != PY_LOCK_ACQUIRED) {
-		PyErr_SetString(PyExc_RuntimeError, "unable to acquire lock");
+	if(!rf_acquire_lock(rf))
 		return -1;
-	}
 
 	int ret = RsyncFetch_init_locked(rf, args, kwargs);
 
-	PyThread_release_lock(lock);
+	rf_release_lock(rf);
 
 	return ret;
 }
@@ -2240,6 +2265,7 @@ static PyObject *RsyncFetch_new(PyTypeObject *subtype, PyObject *args, PyObject 
 	if(obj) {
 		obj->rf = RsyncFetch_0;
 
+#ifdef WITH_THREAD
 		PyThread_type_lock lock = PyThread_allocate_lock();
 		if(lock) {
 			obj->rf.lock = lock;
@@ -2247,6 +2273,9 @@ static PyObject *RsyncFetch_new(PyTypeObject *subtype, PyObject *args, PyObject 
 		}
 
 		RsyncFetch_dealloc(&obj->ob_base);
+#else
+		return &obj->ob_base;
+#endif
 	}
 	return NULL;
 }
@@ -2281,17 +2310,12 @@ static PyObject *RsyncFetch_run(PyObject *self) {
 	if(!rf)
 		return NULL;
 
-	PyThread_type_lock lock = rf->lock;
-	PyLockStatus have_lock;
-	Py_BEGIN_ALLOW_THREADS
-	have_lock = PyThread_acquire_lock(lock, WAIT_LOCK);
-	Py_END_ALLOW_THREADS
-	if(have_lock != PY_LOCK_ACQUIRED)
-		return PyErr_Format(PyExc_RuntimeError, "unable to acquire lock");
+	if(!rf_acquire_lock(rf))
+		return NULL;
 
 	PyObject *ret = RsyncFetch_run_locked(rf);
 
-	PyThread_release_lock(lock);
+	rf_release_lock(rf);
 
 	return ret;
 }
