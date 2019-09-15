@@ -481,18 +481,19 @@ static rf_status_t rf_iterate(RsyncFetch_t *rf, PyObject *iterable, char ***list
 				list = newlist;
 				char *string_location = (char *)(list + fill + 1);
 				for(size_t i = 0; i < fill; i++) {
-					Py_ssize_t len;
+					PyObject *bytes = list[i];
 					char *buf;
-					if(PyBytes_AsStringAndSize(list[i], &buf, &len) == -1) {
+					Py_ssize_t len;
+					if(PyBytes_AsStringAndSize(bytes, &buf, &len) == -1) {
 						s = RF_STATUS_PYTHON;
 						break;
 					}
-					Py_DecRef(list[i]);
-					list[i] = string_location;
-					converted++;
 					len++; // include the trailing \0
 					memcpy(string_location, buf, len);
+					Py_DecRef(bytes);
+					list[i] = string_location;
 					string_location += len;
+					converted++;
 				}
 				list[fill] = string_location;
 			} else {
@@ -2364,7 +2365,7 @@ PyMODINIT_FUNC PyInit_rsync_fetch(void) {
 	PyObject *dict = ((PyTypeObject *)&RsyncFetch_type)->tp_dict;
 	if(!PyDict_Check(dict))
 		return NULL;
-	PyObject *options = Py_BuildValue("(yyy)", "--server", "--sender", "-lHogDtpre.iLsf");
+	PyObject *options = Py_BuildValue("[yyy]", "--server", "--sender", "-lHogDtpre.iLsf");
 	if(!options)
 		return NULL;
 	int r = PyDict_SetItemString(dict, "required_options", options);
