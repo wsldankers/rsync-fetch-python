@@ -1,9 +1,10 @@
 #! /usr/bin/make -f
 
-export PYBUILD_NAME = rsync-fetch
+export PYBUILD_NAME = rsync_fetch
+package-name = $(subst _,-,$(PYBUILD_NAME))
 
 %:
 	exec dh $@ --with=python3 --buildsystem=pybuild
 
 override_dh_strip:
-	exec dh_strip --package=python3-$(PYBUILD_NAME) --dbg-package=python3-$(PYBUILD_NAME)-dbg
+	exec dh_strip --package=python3-$(package-name) --dbg-package=python3-$(package-name)-dbg
