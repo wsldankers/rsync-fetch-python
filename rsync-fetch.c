@@ -23,6 +23,11 @@
 
 #define orz(x) (sizeof (x) / sizeof *(x))
 
+static inline void ignore_result(ssize_t r) {
+	if(r == -1)
+		return;
+}
+
 #ifdef WORDS_BIGENDIAN
 
 #ifdef HAVE_BUILTIN_BSWAP16
@@ -392,6 +397,8 @@ static rf_status_t rf_refstring_dup(RsyncFetch_t *rf, char *str, char **strp) {
 		h->refcount++;
 		if(strp)
 			*strp = str;
+	} else if(strp) {
+		*strp = NULL;
 	}
 	return RF_STATUS_OK;
 }
@@ -875,6 +882,42 @@ static rf_status_t rf_wait_for_eof(RsyncFetch_t *rf) {
 	}
 }
 
+static void rf_drain_err_stream(RsyncFetch_t *rf) {
+	rf_pipestream_t *err_stream = &rf->err_stream;
+	int err_fd = err_stream->fd;
+	int timeout = 2000;
+
+	if(err_fd != -1) {
+		for(;;) {
+			struct pollfd pfd = { .fd = err_fd, .events = POLLIN };
+
+			rf_unblock_threads(rf);
+			int r = poll(&pfd, 1, timeout);
+			if(r == 0 || r == -1)
+				break;
+
+			if(pfd.revents & POLLIN)
+				if(rf_read_error_stream(rf) != RF_STATUS_OK)
+					return;
+
+			if(pfd.revents & (POLLERR|POLLHUP))
+				break;
+		}
+	}
+
+	char *buf = err_stream->buf;
+	size_t fill = err_stream->fill;
+	if(buf && fill) {
+		PyObject *error_callback = rf->error_callback;
+		if(error_callback) {
+			rf_block_threads(rf);
+			Py_DecRef(PyObject_CallFunction(error_callback, "y#", buf, (Py_ssize_t)fill));
+		} else {
+			ignore_result(write(STDERR_FILENO, buf, fill));
+		}
+	}
+}
+
 __attribute__((hot))
 static rf_status_t rf_recv_bytes(RsyncFetch_t *rf, char *buf, size_t len) {
 	if(!rf->multiplex)
@@ -923,7 +966,7 @@ static rf_status_t rf_recv_bytes(RsyncFetch_t *rf, char *buf, size_t len) {
 						if(error_callback) {
 							bool was_unblocked = rf_block_threads(rf);
 							PyObject *result = PyObject_CallFunction(error_callback, "y#i",
-                                message, multiplex_in_remaining, channel);
+								message, multiplex_in_remaining, channel);
 							free(message);
 							if(!result)
 								return RF_STATUS_PYTHON;
@@ -2074,12 +2117,50 @@ static void rf_clear(RsyncFetch_t *rf) {
 	if(rf) {
 		rf->closed = true;
 
+		rf_unblock_threads(rf);
 		rf_stream_clear(rf, &rf->in_stream);
 		rf_stream_clear(rf, &rf->out_stream);
+		rf_drain_err_stream(rf);
+		rf_unblock_threads(rf);
 		rf_stream_clear(rf, &rf->err_stream);
 
-		if(rf->pid) {
-			while(waitpid(rf->pid, NULL, 0) == -1 && errno == EINTR);
+		pid_t pid = rf->pid;
+		if(pid) {
+			rf_unblock_threads(rf);
+			if(waitpid(pid, NULL, WNOHANG) == 0) {
+				kill(pid, SIGTERM);
+#if 1
+				usleep(100000);
+				for(int i = 0; i < 20; i++) {
+					if(waitpid(pid, NULL, WNOHANG) != 0) {
+						pid = 0;
+						break;
+					}
+					usleep(100000);
+				}
+				if(pid) {
+					kill(pid, SIGKILL);
+					while(waitpid(pid, NULL, 0) == -1 && errno == EINTR);
+				}
+#else
+				int killer = fork();
+				switch(killer) {
+					case 0:
+						sleep(2);
+						kill(pid, SIGKILL);
+						_exit(0);
+					case -1:
+						sleep(1);
+						kill(pid, SIGKILL);
+						while(waitpid(pid, NULL, 0) == -1 && errno == EINTR);
+						break;
+					default:
+						while(waitpid(pid, NULL, 0) == -1 && errno == EINTR);
+						kill(killer, SIGKILL);
+						while(waitpid(killer, NULL, 0) == -1 && errno == EINTR);
+				}
+#endif
+			}
 			rf->pid = 0;
 		}
 
