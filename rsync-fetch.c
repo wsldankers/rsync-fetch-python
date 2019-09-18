@@ -9,9 +9,11 @@
 #include <unistd.h>
 #include <inttypes.h>
 #include <errno.h>
+#include <time.h>
 #include <poll.h>
 #include <signal.h>
 #include <sys/types.h>
+#include <sys/time.h>
 #include <sys/wait.h>
 #include <sys/uio.h>
 #include <avl.h>
@@ -26,6 +28,79 @@
 static inline void ignore_result(ssize_t r) {
 	if(r == -1)
 		return;
+}
+
+typedef uint64_t nanosecond_t;
+#define NANOSECOND_C(x) UINT64_C(x)
+#define PRIuNANOSECOND PRIu64
+#define PRIxNANOSECOND PRIx64
+#define PRIXNANOSECOND PRIX64
+
+static inline nanosecond_t timespec2nanoseconds(struct timespec *ts) {
+	return (nanosecond_t)ts->tv_sec * NANOSECOND_C(1000000000)
+		+ (nanosecond_t)ts->tv_nsec;
+}
+
+__attribute__((unused))
+static inline struct timespec nanoseconds2timespec(nanosecond_t ns) {
+#if 0
+	// signed nanosecond case
+	nanosecond_t tv_nsec = (ns % NANOSECOND_C(1000000000) + NANOSECOND_C(1000000000))
+		% NANOSECOND_C(1000000000);
+	struct timespec ts = {
+		(ns - tv_nsec) / NANOSECOND_C(1000000000),
+		tv_nsec,
+	};
+#else
+	// unsigned nanosecond case
+	struct timespec ts = {
+		ns / NANOSECOND_C(1000000000),
+		ns % NANOSECOND_C(1000000000),
+	};
+#endif
+	return ts;
+}
+
+static nanosecond_t nanosecond_get_clock(void) {
+	struct timespec ts;
+	static bool cg_b0rked = false, gtod_b0rked = false;
+	if(cg_b0rked || clock_gettime(CLOCK_MONOTONIC, &ts) == -1) {
+		cg_b0rked = true;
+		struct timeval tv;
+		if(gtod_b0rked || gettimeofday(&tv, NULL) == -1) {
+			gtod_b0rked = true;
+			return (nanosecond_t)time(NULL) * NANOSECOND_C(1000000000);
+		} else {
+			ts.tv_sec = tv.tv_sec;
+			ts.tv_nsec = tv.tv_usec * (suseconds_t)1000;
+		}
+	}
+	return timespec2nanoseconds(&ts);
+}
+
+#include <execinfo.h>
+__attribute__((unused))
+static void cluck(const char *fmt, ...) {
+	void *trace[128];
+	char boem[128];
+	int r;
+	va_list ap;
+
+	ignore_result(write(STDERR_FILENO, "\n", 1));
+	if(fmt) {
+		va_start(ap, fmt);
+		r = vsnprintf(boem, sizeof boem, fmt, ap);
+		va_end(ap);
+		if(r > 0) {
+			if(r > sizeof boem - 1)
+				r = sizeof boem - 1;
+			if(boem[r - 1] != '\n')
+				boem[r++] = '\n';
+			ignore_result(write(STDERR_FILENO, boem, r));
+		}
+	}
+	backtrace_symbols_fd(trace, backtrace(trace, orz(trace)), STDERR_FILENO);
+	ignore_result(write(STDERR_FILENO, "\n", 1));
 }
 
 #ifdef WORDS_BIGENDIAN
@@ -882,16 +957,21 @@ static rf_status_t rf_wait_for_eof(RsyncFetch_t *rf) {
 	}
 }
 
-static void rf_drain_err_stream(RsyncFetch_t *rf) {
+static void rf_drain_err_stream(RsyncFetch_t *rf, nanosecond_t deadline) {
 	rf_pipestream_t *err_stream = &rf->err_stream;
 	int err_fd = err_stream->fd;
-	int timeout = 2000;
 
 	if(err_fd != -1) {
 		for(;;) {
 			struct pollfd pfd = { .fd = err_fd, .events = POLLIN };
 
 			rf_unblock_threads(rf);
+
+			nanosecond_t now = nanosecond_get_clock();
+			if(now >= deadline)
+				break;
+			int timeout = (int)((deadline - now + NANOSECOND_C(999999)) / NANOSECOND_C(1000000));
+
 			int r = poll(&pfd, 1, timeout);
 			if(r == 0 || r == -1)
 				break;
@@ -1850,8 +1930,7 @@ static rf_status_t rf_recv_filedata(RsyncFetch_t *rf, rf_flist_entry_t *entry) {
 			rf_block_threads(rf);
 
 			PyObject *result = PyObject_CallFunctionObjArgs(data_callback, bytes, NULL);
-			rf->chunk_bytes = NULL;
-			Py_DecRef(bytes);
+			Py_CLEAR(rf->chunk_bytes);
 			if(!result)
 				return RF_STATUS_PYTHON;
 			Py_DecRef(result);
@@ -2120,46 +2199,26 @@ static void rf_clear(RsyncFetch_t *rf) {
 		rf_unblock_threads(rf);
 		rf_stream_clear(rf, &rf->in_stream);
 		rf_stream_clear(rf, &rf->out_stream);
-		rf_drain_err_stream(rf);
+
+		pid_t pid = rf->pid;
+		if(pid)
+			kill(pid, SIGTERM);
+
+		nanosecond_t deadline = nanosecond_get_clock() + NANOSECOND_C(2000000000);
+
+		rf_drain_err_stream(rf, deadline);
 		rf_unblock_threads(rf);
 		rf_stream_clear(rf, &rf->err_stream);
 
-		pid_t pid = rf->pid;
 		if(pid) {
-			rf_unblock_threads(rf);
-			if(waitpid(pid, NULL, WNOHANG) == 0) {
-				kill(pid, SIGTERM);
-#if 1
-				usleep(100000);
-				for(int i = 0; i < 20; i++) {
-					if(waitpid(pid, NULL, WNOHANG) != 0) {
-						pid = 0;
-						break;
-					}
+			while(waitpid(pid, NULL, WNOHANG) == 0) {
+				if(nanosecond_get_clock() < deadline) {
 					usleep(100000);
-				}
-				if(pid) {
+				} else {
 					kill(pid, SIGKILL);
 					while(waitpid(pid, NULL, 0) == -1 && errno == EINTR);
+					break;
 				}
-#else
-				int killer = fork();
-				switch(killer) {
-					case 0:
-						sleep(2);
-						kill(pid, SIGKILL);
-						_exit(0);
-					case -1:
-						sleep(1);
-						kill(pid, SIGKILL);
-						while(waitpid(pid, NULL, 0) == -1 && errno == EINTR);
-						break;
-					default:
-						while(waitpid(pid, NULL, 0) == -1 && errno == EINTR);
-						kill(killer, SIGKILL);
-						while(waitpid(killer, NULL, 0) == -1 && errno == EINTR);
-				}
-#endif
 			}
 			rf->pid = 0;
 		}
