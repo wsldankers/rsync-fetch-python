@@ -254,7 +254,6 @@ typedef struct rf_flist_entry {
 	int32_t gid;
 	int32_t major;
 	int32_t minor;
-	int32_t ndx;
 	bool is_hardlink_target;
 } rf_flist_entry_t;
 static const rf_flist_entry_t rf_flist_entry_0;
@@ -265,7 +264,6 @@ typedef struct rf_flist {
 	size_t num;
 	size_t offset;
 	rf_flist_entry_t **entries;
-	bool has_hardlinks;
 } rf_flist_t;
 static const rf_flist_t rf_flist_0 = { .node = AVL_NODE_INITIALIZER(NULL) };
 
@@ -1463,11 +1461,9 @@ static void rf_flist_entry_clear(RsyncFetch_t *rf, rf_flist_entry_t *entry) {
 		rf_refstring_free(rf, &entry->group);
 		rf_refstring_free(rf, &entry->symlink);
 		rf_refstring_free(rf, &entry->hardlink);
-		PyObject *data_callback = entry->data_callback;
-		if(data_callback) {
+		if(entry->data_callback) {
 			rf_block_threads(rf);
-			entry->data_callback = NULL;
-			Py_DecRef(data_callback);
+			Py_CLEAR(entry->data_callback);
 		}
 	}
 }
@@ -1597,16 +1593,42 @@ static void rf_flist_free(RsyncFetch_t *rf, rf_flist_t **flistp) {
 	}
 }
 
-static void rf_flist_free_non_hardlinks(RsyncFetch_t *rf, rf_flist_t *flist) {
-	rf_flist_entry_t **entries = flist->entries;
-	if(entries) {
-		size_t num = flist->num;
-		for(size_t i = 0; i < num; i++) {
-			rf_flist_entry_t *entry = entries[i];
-			if(entry && !entry->is_hardlink_target) {
-				rf_flist_entry_free(rf, entry);
-				entries[i] = NULL;
+static void rf_flist_free_unless_hardlinks(RsyncFetch_t *rf, rf_flist_t *flist) {
+	if(flist) {
+		// the part of the entries list we need to keep
+		size_t hardlinks_section = 0;
+		rf_flist_entry_t **entries = flist->entries;
+		if(entries) {
+			size_t num = flist->num;
+			for(size_t i = 0; i < num; i++) {
+				rf_flist_entry_t *entry = entries[i];
+				if(entry) {
+					if(entry->is_hardlink_target) {
+						hardlinks_section = i + 1;
+						rf_refstring_free(rf, &entry->name);
+						rf_refstring_free(rf, &entry->user);
+						rf_refstring_free(rf, &entry->group);
+						rf_refstring_free(rf, &entry->symlink);
+						if(entry->data_callback) {
+							rf_block_threads(rf);
+							Py_CLEAR(entry->data_callback);
+						}
+					} else {
+						rf_flist_entry_free(rf, entry);
+						entries[i] = NULL;
+					}
+				}
 			}
+		}
+		if(hardlinks_section) {
+			rf_flist_entry_t **new_entries = realloc(entries, hardlinks_section * sizeof *entries);
+			if(new_entries) {
+				flist->entries = new_entries;
+				flist->num = hardlinks_section;
+				flist->size = hardlinks_section;
+			}
+		} else {
+			rf_flist_free(rf, &flist);
 		}
 	}
 }
@@ -1630,9 +1652,6 @@ static rf_status_t rf_flist_add_entry(RsyncFetch_t *rf, rf_flist_t *flist, rf_fl
 	}
 	entries[num] = entry;
 	flist->num = num + 1;
-
-	if(entry->is_hardlink_target)
-		flist->has_hardlinks = true;
 	
 	return RF_STATUS_OK;
 }
@@ -1683,10 +1702,11 @@ static rf_status_t rf_fill_flist_entry(RsyncFetch_t *rf, rf_flist_entry_t *entry
 
 	RF_PROPAGATE_ERROR(rf_refstring_dup(rf, name, &rf->last.name));
 
-	entry->ndx = rf->ndx++;
-	entry->is_hardlink_target = xflags & XMIT_HLINK_FIRST;
+	rf->ndx++;
 
-	if(xflags & XMIT_HLINKED && !(xflags & XMIT_HLINK_FIRST)) {
+	if(xflags & XMIT_HLINK_FIRST) {
+		entry->is_hardlink_target = true;
+	} else if(xflags & XMIT_HLINKED) {
 		int32_t hlink;
 		RF_PROPAGATE_ERROR(rf_recv_varint(rf, &hlink));
 
@@ -1842,6 +1862,7 @@ static rf_status_t rf_recv_flist_entry(RsyncFetch_t *rf, rf_flist_entry_t **entr
 static rf_status_t rf_recv_flist(RsyncFetch_t *rf) {
 	rf_flist_t *flist;
 	RF_PROPAGATE_ERROR(rf_flist_new(rf, rf->ndx, &flist));
+
 	for(;;) {
 		rf_flist_entry_t *entry;
 		RF_PROPAGATE_ERROR(rf_recv_flist_entry(rf, &entry));
@@ -1849,8 +1870,10 @@ static rf_status_t rf_recv_flist(RsyncFetch_t *rf) {
 			break;
 		RF_PROPAGATE_ERROR(rf_flist_add_entry(rf, flist, entry));
 	}
-	size_t num = flist->num;
+
 	rf->ndx++;
+
+	size_t num = flist->num;
 	if(num) {
 		rf_flist_entry_t **entries;
 		if(num != flist->size) {
@@ -2042,10 +2065,7 @@ static rf_status_t rf_mainloop(RsyncFetch_t *rf) {
 			if(first_flist) {
 				rf_flist_t *flist = first_flist->item;
 				first_flist = first_flist->next;
-				if(flist->has_hardlinks)
-					rf_flist_free_non_hardlinks(rf, flist);
-				else
-					rf_flist_free(rf, &flist);
+				rf_flist_free_unless_hardlinks(rf, flist);
 			}
 			if(!first_flist) {
 				phase++;
