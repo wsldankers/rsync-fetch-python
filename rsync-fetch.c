@@ -2169,7 +2169,7 @@ static rf_status_t rf_run(RsyncFetch_t *rf) {
 			rf->out_stream.fd = out_pipe[1];
 			if(create_pipe(err_pipe) != -1) {
 				rf->err_stream.fd = err_pipe[0];
-				int pid = vfork();
+				pid_t pid = vfork();
 				if(pid == 0) {
 					if(dup2(out_pipe[0], STDIN_FILENO) == -1
 					|| dup2(in_pipe[1], STDOUT_FILENO) == -1
