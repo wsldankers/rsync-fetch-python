@@ -255,6 +255,7 @@ typedef struct rf_flist_entry {
 	int32_t major;
 	int32_t minor;
 	int32_t ndx;
+	bool is_hardlink_target;
 } rf_flist_entry_t;
 static const rf_flist_entry_t rf_flist_entry_0;
 
@@ -264,6 +265,7 @@ typedef struct rf_flist {
 	size_t num;
 	size_t offset;
 	rf_flist_entry_t **entries;
+	bool has_hardlinks;
 } rf_flist_t;
 static const rf_flist_t rf_flist_0 = { .node = AVL_NODE_INITIALIZER(NULL) };
 
@@ -957,14 +959,12 @@ static rf_status_t rf_wait_for_eof(RsyncFetch_t *rf) {
 	}
 }
 
-static void rf_drain_err_stream(RsyncFetch_t *rf, nanosecond_t deadline) {
+static void rf_drain_error_stream(RsyncFetch_t *rf, nanosecond_t deadline) {
 	rf_pipestream_t *err_stream = &rf->err_stream;
 	int err_fd = err_stream->fd;
 
 	if(err_fd != -1) {
 		for(;;) {
-			struct pollfd pfd = { .fd = err_fd, .events = POLLIN };
-
 			rf_unblock_threads(rf);
 
 			nanosecond_t now = nanosecond_get_clock();
@@ -972,6 +972,7 @@ static void rf_drain_err_stream(RsyncFetch_t *rf, nanosecond_t deadline) {
 				break;
 			int timeout = (int)((deadline - now + NANOSECOND_C(999999)) / NANOSECOND_C(1000000));
 
+			struct pollfd pfd = { .fd = err_fd, .events = POLLIN };
 			int r = poll(&pfd, 1, timeout);
 			if(r == 0 || r == -1)
 				break;
@@ -1606,6 +1607,9 @@ static rf_status_t rf_flist_add_entry(RsyncFetch_t *rf, rf_flist_t *flist, rf_fl
 	}
 	entries[num] = entry;
 	flist->num = num + 1;
+
+	if(entry->is_hardlink_target)
+		flist->has_hardlinks = true;
 	
 	return RF_STATUS_OK;
 }
@@ -1657,8 +1661,8 @@ static rf_status_t rf_fill_flist_entry(RsyncFetch_t *rf, rf_flist_entry_t *entry
 	RF_PROPAGATE_ERROR(rf_refstring_dup(rf, name, &rf->last.name));
 
 	entry->ndx = rf->ndx++;
+	entry->is_hardlink_target = xflags & XMIT_HLINK_FIRST;
 
-	rf_flist_entry_t *hardlink;
 	if(xflags & XMIT_HLINKED && !(xflags & XMIT_HLINK_FIRST)) {
 		int32_t hlink;
 		RF_PROPAGATE_ERROR(rf_recv_varint(rf, &hlink));
@@ -1668,14 +1672,15 @@ static rf_status_t rf_fill_flist_entry(RsyncFetch_t *rf, rf_flist_entry_t *entry
 			return RF_STATUS_PROTO;
 		rf_flist_t *flist = node->item;
 		if(hlink < flist->offset) {
-			hardlink = rf_find_ndx(rf, hlink);
+			rf_flist_entry_t *hardlink = rf_find_ndx(rf, hlink);
 			if(!hardlink) {
 				fprintf(stderr, "unable to connect hardlink for %s\n", name);
 				fprintf(stderr, "min_offset = %zu  ndx = %"PRId32"\n", ((rf_flist_t *)rf->flists.head->item)->offset, hlink);
+				return RF_STATUS_PROTO;
 			}
 			RF_PROPAGATE_ERROR(rf_refstring_dup(rf, hardlink->name, &entry->hardlink));
 		} else {
-			hardlink = rf_flist_get_entry(rf, flist, hlink);
+			rf_flist_entry_t *hardlink = rf_flist_get_entry(rf, flist, hlink);
 			if(!hardlink)
 				return RF_STATUS_PROTO;
 
@@ -1701,8 +1706,6 @@ static rf_status_t rf_fill_flist_entry(RsyncFetch_t *rf, rf_flist_entry_t *entry
 			RF_PROPAGATE_ERROR(rf_refstring_dup(rf, hardlink->name, &entry->hardlink));
 			return RF_STATUS_OK;
 		}
-	} else {
-		hardlink = NULL;
 	}
 
 	RF_PROPAGATE_ERROR(rf_recv_varlong(rf, 3, &entry->size));
@@ -2010,26 +2013,24 @@ static rf_status_t rf_mainloop(RsyncFetch_t *rf) {
 
 	RF_PROPAGATE_ERROR(rf_recv_flist(rf));
 
-	int phase = 0;
-	size_t num_flists = 1;
+	avl_node_t *first_flist = NULL;
 
-	for(;;) {
+	for(int phase = 0; phase <= 2;) {
 		int32_t ndx;
 		RF_PROPAGATE_ERROR(rf_recv_ndx(rf, &ndx));
 		if(ndx == NDX_FLIST_EOF) {
 			// do nothing
 		} else if(ndx == NDX_DONE) {
-//			rf_flist_t *flist = rf->flists.head->item;
-//			rf_flist_free(rf, &flist);
-			if(num_flists)
-				num_flists--;
-//			if(!rf->flists.head) {
-			if(!num_flists) {
+			if(first_flist) {
+				rf_flist_t *flist = first_flist->item;
+				first_flist = first_flist->next;
+				if(!flist->has_hardlinks)
+					rf_flist_free(rf, &flist);
+			}
+			if(!first_flist) {
 				phase++;
 				RF_PROPAGATE_ERROR(rf_send_ndx(rf, NDX_DONE));
 			}
-			if(phase > 2)
-				break;
 		} else if(ndx > 0) {
 			// recv_attrs
 			uint16_t iflags;
@@ -2062,8 +2063,9 @@ static rf_status_t rf_mainloop(RsyncFetch_t *rf) {
 			RF_PROPAGATE_ERROR(rf_recv_bytes(rf, md5, sizeof md5));
 		} else {
 			// ndx = NDX_FLIST_OFFSET - ndx
-			num_flists++;
 			RF_PROPAGATE_ERROR(rf_recv_flist(rf));
+			if(!first_flist)
+				first_flist = rf->flists.head;
 		}
 	}
 
@@ -2206,7 +2208,7 @@ static void rf_clear(RsyncFetch_t *rf) {
 
 		nanosecond_t deadline = nanosecond_get_clock() + NANOSECOND_C(2000000000);
 
-		rf_drain_err_stream(rf, deadline);
+		rf_drain_error_stream(rf, deadline);
 		rf_unblock_threads(rf);
 		rf_stream_clear(rf, &rf->err_stream);
 
