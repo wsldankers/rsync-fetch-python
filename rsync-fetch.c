@@ -272,6 +272,9 @@ typedef struct rf_hardlinks {
 	int32_t ndx[2];
 } rf_hardlinks_t;
 
+#define RF_HARDLINKS_BUFSIZE (65536 - RF_BUFSIZE_ADJUSTMENT)
+#define RF_HARDLINKS_SIZE ((RF_HARDLINKS_BUFSIZE - sizeof(avl_node_t)) / sizeof(rf_hardlinks_t))
+
 #define RF_PROPAGATE_ERROR(x) do { rf_status_t __rf_propagate_error = (x); if(__rf_propagate_error != RF_STATUS_OK) return __rf_propagate_error; } while(false)
 //define RF_PROPAGATE_ERROR(x) do { rf_status_t __rf_propagate_error = (x); if(__rf_propagate_error != RF_STATUS_OK) { if(__rf_propagate_error == RF_STATUS_PROTO) fprintf(stderr, "%s:%d: protocol error propagated by %s()\n", __FILE__, __LINE__, __func__); return __rf_propagate_error; } } while(false)
 
@@ -283,6 +286,12 @@ static int rf_flist_cmp(const void *a, const void *b, void *userdata) {
 	size_t offset_a = ((rf_flist_t *)a)->offset;
 	size_t offset_b = ((rf_flist_t *)b)->offset;
 	return AVL_CMP(offset_a, offset_b);
+}
+
+static int rf_hardlinks_cmp(const void *a, const void *b, void *userdata) {
+	size_t ndx_a = ((rf_hardlinks_t *)a)->ndx[0];
+	size_t ndx_b = ((rf_hardlinks_t *)b)->ndx[0];
+	return AVL_CMP(ndx_a, ndx_b);
 }
 
 typedef struct RsyncFetch {
@@ -300,15 +309,14 @@ typedef struct RsyncFetch {
 	char **command;
 	char **environ;
 	char **filters;
-	rf_hardlinks_t *hardlinks;
 	avl_tree_t flists;
+	avl_tree_t hardlinks;
 	rf_pipestream_t in_stream;
 	rf_pipestream_t out_stream;
 	rf_pipestream_t err_stream;
 	rf_flist_entry_t last;
 	uint64_t timeout;
 	size_t hardlinks_num;
-	size_t hardlinks_size;
 	size_t filters_num;
 	size_t multiplex_in_remaining;
 	size_t multiplex_out_remaining;
@@ -330,6 +338,8 @@ static const RsyncFetch_t RsyncFetch_0 = {
 	.out_stream = PIPESTREAM_INITIALIZER,
 	.err_stream = PIPESTREAM_INITIALIZER,
 	.flists = AVL_TREE_INITIALIZER(rf_flist_cmp, NULL),
+	.hardlinks = AVL_TREE_INITIALIZER(rf_hardlinks_cmp, NULL),
+	.hardlinks_num = RF_HARDLINKS_SIZE,
 	.ndx = 1,
 	.prev_negative_ndx_in = 1,
 	.prev_positive_ndx_in = -1,
@@ -1463,37 +1473,38 @@ static rf_status_t rf_recv_vstring(RsyncFetch_t *rf, char **bufp) {
 }
 
 static rf_status_t rf_hardlink_add(RsyncFetch_t *rf, int32_t ndx, char *name) {
-	rf_hardlinks_t *hardlinks = rf->hardlinks;
 	size_t num = rf->hardlinks_num;
-	size_t size = rf->hardlinks_size;
-	if(num == size) {
-		size += 2;
-		if(size < 16)
-			size = 16;
-		size <<= 1;
-		size -= 2;
-		hardlinks = realloc(hardlinks, (size >> 1) * sizeof *hardlinks);
-		if(!hardlinks)
+	if(num == RF_HARDLINKS_SIZE) {
+		avl_node_t *node = malloc(RF_HARDLINKS_BUFSIZE);
+		if(!node)
 			return RF_STATUS_ERRNO;
-		rf->hardlinks = hardlinks;
-		rf->hardlinks_size = size;
+		rf_hardlinks_t *hardlink = node->item = node + 1;
+		hardlink->ndx[0] = ndx;
+		rf_status_t status = rf_refstring_dup(rf, name, &hardlink->name[0]);
+		if(status != RF_STATUS_OK) {
+			free(node);
+			return status;
+		}
+		rf->hardlinks_num = 1;
+		avl_insert_before(&rf->hardlinks, NULL, node);
+	} else {
+		rf_hardlinks_t *hardlinks = rf->hardlinks.tail->item;
+		rf_hardlinks_t *hardlink = hardlinks + (num >> 1);
+		hardlink->ndx[num & 1] = ndx;
+		RF_PROPAGATE_ERROR(rf_refstring_dup(rf, name, &hardlink->name[num & 1]));
+		rf->hardlinks_num = num + 1;
 	}
-	if(num) {
-		size_t prev_num = num - 1;
-		if(ndx <= hardlinks[prev_num >> 1].ndx[prev_num & 1])
-			return RF_STATUS_ASSERT;
-	}
-	rf_hardlinks_t *hardlink = hardlinks + (num >> 1);
-	hardlink->ndx[num & 1] = ndx;
-	RF_PROPAGATE_ERROR(rf_refstring_dup(rf, name, &hardlink->name[num & 1]));
-	rf->hardlinks_num = num + 1;
 	return RF_STATUS_OK;
 }
 
 static char *rf_hardlink_find(RsyncFetch_t *rf, int32_t ndx) {
-	rf_hardlinks_t *hardlinks = rf->hardlinks;
+	rf_hardlinks_t dummy = { .ndx = { ndx, 0 } };
+	avl_node_t *node = avl_search_right(&rf->flists, &dummy, NULL);
+	if(!node)
+		return NULL;
+	rf_hardlinks_t *hardlinks = node->item;
 	size_t lower = 0;
-	size_t upper = rf->hardlinks_num;
+	size_t upper = node == rf->hardlinks.tail ? rf->hardlinks_num : RF_HARDLINKS_SIZE;
 
 	while(lower != upper) {
 		size_t guess = lower + (upper - lower) / 2;
@@ -2309,12 +2320,7 @@ static void rf_clear(RsyncFetch_t *rf) {
 			rf_flist_free(rf, &flist);
 		}
 
-		rf_hardlinks_t *hardlinks = rf->hardlinks;
-		size_t hardlinks_num = rf->hardlinks_num;
-		for(size_t i = 0; i < hardlinks_num; i++)
-			rf_refstring_free(rf, &hardlinks[i >> 1].name[i & 1]);
-		free(hardlinks);
-		rf->hardlinks = NULL;
+		avl_tree_purge(&rf->hardlinks);
 
 		free(rf->command);
 		rf->command = NULL;
