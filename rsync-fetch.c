@@ -267,6 +267,11 @@ typedef struct rf_flist {
 } rf_flist_t;
 static const rf_flist_t rf_flist_0 = { .node = AVL_NODE_INITIALIZER(NULL) };
 
+typedef struct rf_hardlinks {
+	char *name[2];
+	int32_t ndx[2];
+} rf_hardlinks_t;
+
 #define RF_PROPAGATE_ERROR(x) do { rf_status_t __rf_propagate_error = (x); if(__rf_propagate_error != RF_STATUS_OK) return __rf_propagate_error; } while(false)
 //define RF_PROPAGATE_ERROR(x) do { rf_status_t __rf_propagate_error = (x); if(__rf_propagate_error != RF_STATUS_OK) { if(__rf_propagate_error == RF_STATUS_PROTO) fprintf(stderr, "%s:%d: protocol error propagated by %s()\n", __FILE__, __LINE__, __func__); return __rf_propagate_error; } } while(false)
 
@@ -295,22 +300,25 @@ typedef struct RsyncFetch {
 	char **command;
 	char **environ;
 	char **filters;
-	size_t filters_num;
+	rf_hardlinks_t *hardlinks;
 	avl_tree_t flists;
 	rf_pipestream_t in_stream;
 	rf_pipestream_t out_stream;
 	rf_pipestream_t err_stream;
 	rf_flist_entry_t last;
 	uint64_t timeout;
+	size_t hardlinks_num;
+	size_t hardlinks_size;
+	size_t filters_num;
 	size_t multiplex_in_remaining;
 	size_t multiplex_out_remaining;
 	size_t chunk_size;
+	pid_t pid;
 	int32_t ndx;
 	int32_t prev_negative_ndx_in;
 	int32_t prev_positive_ndx_in;
 	int32_t prev_negative_ndx_out;
 	int32_t prev_positive_ndx_out;
-	int pid;
 	bool multiplex;
 	bool failed;
 	bool closed;
@@ -1454,6 +1462,55 @@ static rf_status_t rf_recv_vstring(RsyncFetch_t *rf, char **bufp) {
 	return s;
 }
 
+static rf_status_t rf_hardlink_add(RsyncFetch_t *rf, int32_t ndx, char *name) {
+	rf_hardlinks_t *hardlinks = rf->hardlinks;
+	size_t num = rf->hardlinks_num;
+	size_t size = rf->hardlinks_size;
+	if(num == size) {
+		size += 2;
+		if(size < 16)
+			size = 16;
+		size <<= 1;
+		size -= 2;
+		hardlinks = realloc(hardlinks, (size >> 1) * sizeof *hardlinks);
+		if(!hardlinks)
+			return RF_STATUS_ERRNO;
+		rf->hardlinks = hardlinks;
+		rf->hardlinks_size = size;
+	}
+	if(num) {
+		size_t prev_num = num - 1;
+		if(ndx <= hardlinks[prev_num >> 1].ndx[prev_num & 1])
+			return RF_STATUS_ASSERT;
+	}
+	rf_hardlinks_t *hardlink = hardlinks + (num >> 1);
+	hardlink->ndx[num & 1] = ndx;
+	RF_PROPAGATE_ERROR(rf_refstring_dup(rf, name, &hardlink->name[num & 1]));
+	rf->hardlinks_num = num + 1;
+	return RF_STATUS_OK;
+}
+
+static char *rf_hardlink_find(RsyncFetch_t *rf, int32_t ndx) {
+	rf_hardlinks_t *hardlinks = rf->hardlinks;
+	size_t lower = 0;
+	size_t upper = rf->hardlinks_num;
+
+	while(lower != upper) {
+		size_t guess = lower + (upper - lower) / 2;
+		rf_hardlinks_t *hardlink = hardlinks + (guess >> 1);
+		int32_t guess_ndx = hardlink->ndx[guess & 1];
+
+		if(guess_ndx == ndx)
+			return hardlink->name[guess & 1];
+		else if(guess_ndx < ndx)
+			lower = guess + 1;
+		else
+			upper = guess;
+	}
+
+	return NULL;
+}
+
 static void rf_flist_entry_clear(RsyncFetch_t *rf, rf_flist_entry_t *entry) {
 	if(entry) {
 		rf_refstring_free(rf, &entry->name);
@@ -1595,41 +1652,16 @@ static void rf_flist_free(RsyncFetch_t *rf, rf_flist_t **flistp) {
 
 static void rf_flist_free_unless_hardlinks(RsyncFetch_t *rf, rf_flist_t *flist) {
 	if(flist) {
-		// the part of the entries list we need to keep
-		size_t hardlinks_section = 0;
 		rf_flist_entry_t **entries = flist->entries;
-		if(entries) {
-			size_t num = flist->num;
-			for(size_t i = 0; i < num; i++) {
-				rf_flist_entry_t *entry = entries[i];
-				if(entry) {
-					if(entry->is_hardlink_target) {
-						hardlinks_section = i + 1;
-						rf_refstring_free(rf, &entry->name);
-						rf_refstring_free(rf, &entry->user);
-						rf_refstring_free(rf, &entry->group);
-						rf_refstring_free(rf, &entry->symlink);
-						if(entry->data_callback) {
-							rf_block_threads(rf);
-							Py_CLEAR(entry->data_callback);
-						}
-					} else {
-						rf_flist_entry_free(rf, entry);
-						entries[i] = NULL;
-					}
-				}
-			}
+		size_t num = flist->num;
+		size_t offset = flist->offset;
+		for(size_t i = 0; i < num; i++) {
+			rf_flist_entry_t *entry = entries[i];
+			if(entry && entry->is_hardlink_target)
+				rf_hardlink_add(rf, offset + i, entry->name);
 		}
-		if(hardlinks_section) {
-			rf_flist_entry_t **new_entries = realloc(entries, hardlinks_section * sizeof *entries);
-			if(new_entries) {
-				flist->entries = new_entries;
-				flist->num = hardlinks_section;
-				flist->size = hardlinks_section;
-			}
-		} else {
-			rf_flist_free(rf, &flist);
-		}
+
+		rf_flist_free(rf, &flist);
 	}
 }
 
@@ -1715,13 +1747,13 @@ static rf_status_t rf_fill_flist_entry(RsyncFetch_t *rf, rf_flist_entry_t *entry
 			return RF_STATUS_PROTO;
 		rf_flist_t *flist = node->item;
 		if(hlink < flist->offset) {
-			rf_flist_entry_t *hardlink = rf_find_ndx(rf, hlink);
+			char *hardlink = rf_hardlink_find(rf, hlink);
 			if(!hardlink) {
 				fprintf(stderr, "unable to connect hardlink for %s\n", name);
 				fprintf(stderr, "min_offset = %zu  ndx = %"PRId32"\n", ((rf_flist_t *)rf->flists.head->item)->offset, hlink);
 				return RF_STATUS_PROTO;
 			}
-			RF_PROPAGATE_ERROR(rf_refstring_dup(rf, hardlink->name, &entry->hardlink));
+			RF_PROPAGATE_ERROR(rf_refstring_dup(rf, hardlink, &entry->hardlink));
 		} else {
 			rf_flist_entry_t *hardlink = rf_flist_get_entry(rf, flist, hlink);
 			if(!hardlink)
@@ -2240,8 +2272,6 @@ static void rf_stream_clear(RsyncFetch_t *rf, rf_pipestream_t *stream) {
 
 static void rf_clear(RsyncFetch_t *rf) {
 	if(rf) {
-		rf->closed = true;
-
 		rf_stream_clear(rf, &rf->in_stream);
 		rf_stream_clear(rf, &rf->out_stream);
 
@@ -2278,6 +2308,13 @@ static void rf_clear(RsyncFetch_t *rf) {
 			rf_flist_t *flist = node->item;
 			rf_flist_free(rf, &flist);
 		}
+
+		rf_hardlinks_t *hardlinks = rf->hardlinks;
+		size_t hardlinks_num = rf->hardlinks_num;
+		for(size_t i = 0; i < hardlinks_num; i++)
+			rf_refstring_free(rf, &hardlinks[i >> 1].name[i & 1]);
+		free(hardlinks);
+		rf->hardlinks = NULL;
 
 		free(rf->command);
 		rf->command = NULL;
