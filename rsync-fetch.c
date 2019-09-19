@@ -1480,6 +1480,7 @@ static rf_status_t rf_hardlink_add(RsyncFetch_t *rf, int32_t ndx, char *name) {
 			return RF_STATUS_ERRNO;
 		rf_hardlinks_t *hardlink = node->item = node + 1;
 		hardlink->ndx[0] = ndx;
+		hardlink->name[0] = NULL;
 		rf_status_t status = rf_refstring_dup(rf, name, &hardlink->name[0]);
 		if(status != RF_STATUS_OK) {
 			free(node);
@@ -1491,6 +1492,7 @@ static rf_status_t rf_hardlink_add(RsyncFetch_t *rf, int32_t ndx, char *name) {
 		rf_hardlinks_t *hardlinks = rf->hardlinks.tail->item;
 		rf_hardlinks_t *hardlink = hardlinks + (num >> 1);
 		hardlink->ndx[num & 1] = ndx;
+		hardlink->name[num & 1] = NULL;
 		RF_PROPAGATE_ERROR(rf_refstring_dup(rf, name, &hardlink->name[num & 1]));
 		rf->hardlinks_num = num + 1;
 	}
@@ -1498,27 +1500,33 @@ static rf_status_t rf_hardlink_add(RsyncFetch_t *rf, int32_t ndx, char *name) {
 }
 
 static char *rf_hardlink_find(RsyncFetch_t *rf, int32_t ndx) {
-	rf_hardlinks_t dummy = { .ndx = { ndx, 0 } };
-	avl_node_t *node = avl_search_right(&rf->flists, &dummy, NULL);
-	if(!node)
-		return NULL;
-	rf_hardlinks_t *hardlinks = node->item;
-	size_t lower = 0;
-	size_t upper = node == rf->hardlinks.tail ? rf->hardlinks_num : RF_HARDLINKS_SIZE;
+	avl_node_t *head = rf->flists.head;
+	if(head && ndx < ((rf_flist_t *)head->item)->offset) {
+		rf_hardlinks_t dummy = { .ndx = { ndx, 0 } };
+		avl_node_t *node = avl_search_right(&rf->hardlinks, &dummy, NULL);
+		if(!node)
+			return NULL;
+		rf_hardlinks_t *hardlinks = node->item;
+		size_t lower = 0;
+		size_t upper = node == rf->hardlinks.tail ? rf->hardlinks_num : RF_HARDLINKS_SIZE;
 
-	while(lower != upper) {
-		size_t guess = lower + (upper - lower) / 2;
-		rf_hardlinks_t *hardlink = hardlinks + (guess >> 1);
-		int32_t guess_ndx = hardlink->ndx[guess & 1];
+		while(lower != upper) {
+			size_t guess = lower + (upper - lower) / 2;
+			rf_hardlinks_t *hardlink = hardlinks + (guess >> 1);
+			int32_t guess_ndx = hardlink->ndx[guess & 1];
 
-		if(guess_ndx == ndx)
-			return hardlink->name[guess & 1];
-		else if(guess_ndx < ndx)
-			lower = guess + 1;
-		else
-			upper = guess;
+			if(guess_ndx == ndx)
+				return hardlink->name[guess & 1];
+			else if(guess_ndx < ndx)
+				lower = guess + 1;
+			else
+				upper = guess;
+		}
+	} else {
+		rf_flist_entry_t *entry = rf_find_ndx(rf, ndx);
+		if(entry)
+			return entry->name;
 	}
-
 	return NULL;
 }
 
@@ -2318,6 +2326,14 @@ static void rf_clear(RsyncFetch_t *rf) {
 				break;
 			rf_flist_t *flist = node->item;
 			rf_flist_free(rf, &flist);
+		}
+
+		avl_node_t *last_hardlinks_node = rf->hardlinks.tail;
+		for(avl_node_t *node = rf->hardlinks.head; node; node = node->next) {
+			size_t num = node == last_hardlinks_node ? rf->hardlinks_num : RF_HARDLINKS_SIZE;
+			rf_hardlinks_t *hardlinks = node->item;
+			for(size_t i = 0; i < num; i++)
+				rf_refstring_free(rf, &hardlinks[i >> 1].name[i & 1]);
 		}
 
 		avl_tree_purge(&rf->hardlinks);
