@@ -449,27 +449,6 @@ static inline size_t rf_refstring_len(const rf_refstring_t str) {
 	return str ? ((struct refstring_header *)str)[-1].len : 0;
 }
 
-static rf_status_t rf_refstring_newlen(RsyncFetch_t *rf, const char *src, size_t len, rf_refstring_t *strp) {
-	struct refstring_header *h = malloc(sizeof *h + len + 1);
-	if(!h)
-		return RF_STATUS_ERRNO;
-	h->len = len;
-	h->refcount = 1;
-	rf_refstring_t str = (rf_refstring_t)(h + 1);
-	if(src)
-		memcpy(str, src, len);
-	str[len] = '\0';
-	return *strp = str, RF_STATUS_OK;
-}
-
-__attribute__((unused))
-static rf_status_t rf_refstring_new(RsyncFetch_t *rf, const char *src, rf_refstring_t *strp) {
-	if(src)
-		return rf_refstring_newlen(rf, src, strlen(src), strp);
-	else
-		return *strp = NULL, RF_STATUS_OK;
-}
-
 static void rf_refstring_free(RsyncFetch_t *rf, rf_refstring_t *strp) {
 	if(strp) {
 		char *str = *strp;
@@ -485,6 +464,28 @@ static void rf_refstring_free(RsyncFetch_t *rf, rf_refstring_t *strp) {
 	}
 }
 
+static rf_status_t rf_refstring_newlen(RsyncFetch_t *rf, const char *src, size_t len, rf_refstring_t *strp) {
+	struct refstring_header *h = malloc(sizeof *h + len + 1);
+	if(!h)
+		return RF_STATUS_ERRNO;
+	h->len = len;
+	h->refcount = 1;
+	rf_refstring_t str = (rf_refstring_t)(h + 1);
+	if(src)
+		memcpy(str, src, len);
+	str[len] = '\0';
+	rf_refstring_free(rf, strp);
+	return *strp = str, RF_STATUS_OK;
+}
+
+__attribute__((unused))
+static rf_status_t rf_refstring_new(RsyncFetch_t *rf, const char *src, rf_refstring_t *strp) {
+	if(src)
+		return rf_refstring_newlen(rf, src, strlen(src), strp);
+	else
+		return *strp = NULL, RF_STATUS_OK;
+}
+
 static void rf_refstring_dup(RsyncFetch_t *rf, rf_refstring_t str, rf_refstring_t *strp) {
 	rf_refstring_free(rf, strp);
 	if(str) {
@@ -492,8 +493,6 @@ static void rf_refstring_dup(RsyncFetch_t *rf, rf_refstring_t str, rf_refstring_
 		h->refcount++;
 		if(strp)
 			*strp = str;
-	} else if(strp) {
-		*strp = NULL;
 	}
 }
 
@@ -1452,7 +1451,6 @@ static rf_status_t rf_send_ndx(RsyncFetch_t *rf, int32_t ndx) {
 }
 
 static rf_status_t rf_recv_vstring(RsyncFetch_t *rf, rf_refstring_t *strp) {
-	rf_refstring_free(rf, strp);
 	uint8_t b;
 	RF_PROPAGATE_ERROR(rf_recv_uint8(rf, &b));
 	size_t len;
@@ -1463,13 +1461,15 @@ static rf_status_t rf_recv_vstring(RsyncFetch_t *rf, rf_refstring_t *strp) {
 	} else {
 		len = b;
 	}
-	char *str;
+	char *str = NULL;
 	RF_PROPAGATE_ERROR(rf_refstring_newlen(rf, NULL, len, &str));
 	rf_status_t s = rf_recv_bytes(rf, str, len);
-	if(s == RF_STATUS_OK)
+	if(s == RF_STATUS_OK) {
+		rf_refstring_free(rf, strp);
 		*strp = str;
-	else
+	} else {
 		rf_refstring_free(rf, &str);
+	}
 	return s;
 }
 
@@ -1763,7 +1763,7 @@ static rf_status_t rf_fill_flist_entry(RsyncFetch_t *rf, rf_flist_entry_t *entry
 	if(!name_len)
 		return RF_STATUS_PROTO;
 
-	rf_refstring_t name;
+	rf_refstring_t name = NULL;
 	RF_PROPAGATE_ERROR(rf_refstring_newlen(rf, NULL, name_len, &name));
 	entry->name = name;
 
@@ -1801,22 +1801,17 @@ static rf_status_t rf_fill_flist_entry(RsyncFetch_t *rf, rf_flist_entry_t *entry
 				return RF_STATUS_PROTO;
 
 			entry->size = hardlink->size;
-			uint32_t mode = entry->mode = hardlink->mode;
-			uint64_t mtime = entry->mtime = hardlink->mtime;
-			uint32_t uid = entry->uid = hardlink->uid;
-			uint32_t gid = entry->gid = hardlink->gid;
+			rf->last.mode = entry->mode = hardlink->mode;
+			rf->last.mtime = entry->mtime = hardlink->mtime;
+			rf->last.uid = entry->uid = hardlink->uid;
+			rf->last.gid = entry->gid = hardlink->gid;
 
 			rf_refstring_t user = hardlink->user;
 			rf_refstring_dup(rf, user, &entry->user);
+			rf_refstring_dup(rf, user, &rf->last.user);
 
 			rf_refstring_t group = hardlink->group;
 			rf_refstring_dup(rf, group, &entry->group);
-
-			rf->last.mode = mode;
-			rf->last.mtime = mtime;
-			rf->last.uid = uid;
-			rf->last.gid = gid;
-			rf_refstring_dup(rf, user, &rf->last.user);
 			rf_refstring_dup(rf, group, &rf->last.group);
 
 			rf_refstring_dup(rf, hardlink->name, &entry->hardlink);
@@ -1851,7 +1846,7 @@ static rf_status_t rf_fill_flist_entry(RsyncFetch_t *rf, rf_flist_entry_t *entry
 		if(xflags & XMIT_USER_NAME_FOLLOWS) {
 			uint8_t len;
 			RF_PROPAGATE_ERROR(rf_recv_uint8(rf, &len));
-			rf_refstring_t user;
+			rf_refstring_t user = NULL;
 			RF_PROPAGATE_ERROR(rf_refstring_newlen(rf, NULL, len, &user));
 			entry->user = user;
 			RF_PROPAGATE_ERROR(rf_recv_bytes(rf, user, len));
@@ -1867,7 +1862,7 @@ static rf_status_t rf_fill_flist_entry(RsyncFetch_t *rf, rf_flist_entry_t *entry
 		if(xflags & XMIT_GROUP_NAME_FOLLOWS) {
 			uint8_t len;
 			RF_PROPAGATE_ERROR(rf_recv_uint8(rf, &len));
-			rf_refstring_t group;
+			rf_refstring_t group = NULL;
 			RF_PROPAGATE_ERROR(rf_refstring_newlen(rf, NULL, len, &group));
 			entry->group = group;
 			RF_PROPAGATE_ERROR(rf_recv_bytes(rf, group, len));
@@ -1891,7 +1886,7 @@ static rf_status_t rf_fill_flist_entry(RsyncFetch_t *rf, rf_flist_entry_t *entry
 		RF_PROPAGATE_ERROR(rf_recv_varint(rf, &len));
 		if(len > 65536)
 			return RF_STATUS_PROTO;
-		rf_refstring_t symlink;
+		rf_refstring_t symlink = NULL;
 		RF_PROPAGATE_ERROR(rf_refstring_newlen(rf, NULL, len, &symlink));
 		entry->symlink = symlink;
 		RF_PROPAGATE_ERROR(rf_recv_bytes(rf, symlink, len));
@@ -2153,7 +2148,7 @@ static rf_status_t rf_mainloop(RsyncFetch_t *rf) {
 			if(iflags & ITEM_BASIS_TYPE_FOLLOWS)
 				RF_PROPAGATE_ERROR(rf_recv_uint8(rf, &b));
 			if(iflags & ITEM_XNAME_FOLLOWS) {
-				rf_refstring_t refname;
+				rf_refstring_t refname = NULL;
 				RF_PROPAGATE_ERROR(rf_recv_vstring(rf, &refname));
 				rf_refstring_free(rf, &refname);
 			}
