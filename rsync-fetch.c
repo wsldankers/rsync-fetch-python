@@ -1342,41 +1342,56 @@ static const uint8_t rf_varint_extra[] = {
 };
 
 static rf_status_t rf_recv_varint(RsyncFetch_t *rf, int32_t *d) {
-	uint8_t init;
-	RF_PROPAGATE_ERROR(rf_recv_uint8(rf, &init));
-	size_t extra = rf_varint_extra[init >> 2];
+	uint8_t initial;
+	RF_PROPAGATE_ERROR(rf_recv_uint8(rf, &initial));
+
+	size_t extra = rf_varint_extra[initial >> 2];
 	if(extra) {
-		uint8_t extra_bytes[7];
-		RF_PROPAGATE_ERROR(rf_recv_bytes(rf, (char *)extra_bytes, extra));
-		extra_bytes[extra] = init & ((1 << (8 - extra)) - 1);
-		int32_t v = 0;
-		for(int i = 0; i <= extra; i++)
-			v |= (int32_t)extra_bytes[i] << (8 * i);
-		*d = v;
+		union {
+			char bytes[4];
+			int32_t int32;
+		} buf = { .bytes = {0} };
+
+		if(extra > sizeof buf.bytes)
+			return RF_STATUS_PROTO;
+
+		RF_PROPAGATE_ERROR(rf_recv_bytes(rf, buf.bytes, extra));
+
+		if(extra < sizeof buf.bytes)
+			buf.bytes[extra] = initial & ((1 << (8 - extra)) - 1);
+
+		*d = le32(buf.int32);
 	} else {
-		*d = init;
+		*d = initial;
 	}
 	return RF_STATUS_OK;
 }
 
 static rf_status_t rf_recv_varlong(RsyncFetch_t *rf, size_t min_bytes, int64_t *d) {
-	if(min_bytes > 8)
+	union {
+		char bytes[8];
+		int64_t int64;
+	} buf = { .bytes = {0} };
+
+	min_bytes--;
+	if(min_bytes > sizeof buf.bytes)
 		return RF_STATUS_ASSERT;
-	uint8_t init_bytes[9] = {0};
-	RF_PROPAGATE_ERROR(rf_recv_bytes(rf, (char *)init_bytes, min_bytes));
-	size_t extra = rf_varint_extra[init_bytes[0] >> 2];
-	uint8_t *extra_bytes = init_bytes + 1;
-	size_t total_bytes = min_bytes + extra;
-	if(extra) {
-		if(total_bytes >= sizeof(int64_t))
-			return RF_STATUS_PROTO;
-		RF_PROPAGATE_ERROR(rf_recv_bytes(rf, (char *)init_bytes + min_bytes, extra));
-	}
-	init_bytes[total_bytes] = init_bytes[0] & ((1 << (8 - extra)) - 1);
-	int64_t v = 0;
-	for(int i = 0; i <= total_bytes; i++)
-		v |= (int64_t)extra_bytes[i] << (8 * i);
-	*d = v;
+
+	uint8_t initial;
+	RF_PROPAGATE_ERROR(rf_recv_uint8(rf, &initial));
+
+	size_t extra = rf_varint_extra[initial >> 2];
+	size_t total = min_bytes + extra;
+	if(total > sizeof buf.bytes)
+		return RF_STATUS_PROTO;
+
+	RF_PROPAGATE_ERROR(rf_recv_bytes(rf, buf.bytes, total));
+
+	if(total < sizeof buf.bytes)
+		buf.bytes[total] = initial & ((1 << (8 - extra)) - 1);
+
+	*d = le64(buf.int64);
+
 	return RF_STATUS_OK;
 }
 
