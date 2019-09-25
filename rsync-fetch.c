@@ -261,7 +261,6 @@ typedef struct rf_flist_entry {
 	int32_t gid;
 	int32_t major;
 	int32_t minor;
-	int32_t ndx;
 	bool is_hardlink_target;
 } rf_flist_entry_t;
 static const rf_flist_entry_t rf_flist_entry_0;
@@ -1519,33 +1518,27 @@ static rf_status_t rf_hardlink_add(RsyncFetch_t *rf, int32_t ndx, rf_refstring_t
 }
 
 static rf_refstring_t rf_hardlink_find(RsyncFetch_t *rf, int32_t ndx) {
-	avl_node_t *head = rf->flists.head;
-	if(!head || ndx < ((rf_flist_t *)head->item)->offset) {
-		rf_hardlinks_t dummy = { .ndx = { ndx, 0 } };
-		avl_node_t *node = avl_search_right(&rf->hardlinks, &dummy, NULL);
-		if(!node)
-			return NULL;
-		rf_hardlinks_t *hardlinks = node->item;
-		size_t lower = 0;
-		size_t upper = node == rf->hardlinks.tail ? rf->hardlinks_num : RF_HARDLINKS_SIZE;
+	rf_hardlinks_t dummy = { .ndx = { ndx, 0 } };
+	avl_node_t *node = avl_search_right(&rf->hardlinks, &dummy, NULL);
+	if(!node)
+		return NULL;
+	rf_hardlinks_t *hardlinks = node->item;
+	size_t lower = 0;
+	size_t upper = node == rf->hardlinks.tail ? rf->hardlinks_num : RF_HARDLINKS_SIZE;
 
-		while(lower != upper) {
-			size_t guess = lower + (upper - lower) / 2;
-			rf_hardlinks_t *hardlink = hardlinks + (guess >> 1);
-			int32_t guess_ndx = hardlink->ndx[guess & 1];
+	while(lower != upper) {
+		size_t guess = lower + (upper - lower) / 2;
+		rf_hardlinks_t *hardlink = hardlinks + (guess >> 1);
+		int32_t guess_ndx = hardlink->ndx[guess & 1];
 
-			if(guess_ndx == ndx)
-				return hardlink->name[guess & 1];
-			else if(guess_ndx < ndx)
-				lower = guess + 1;
-			else
-				upper = guess;
-		}
-	} else {
-		rf_flist_entry_t *entry = rf_find_ndx(rf, ndx);
-		if(entry)
-			return entry->name;
+		if(guess_ndx == ndx)
+			return hardlink->name[guess & 1];
+		else if(guess_ndx < ndx)
+			lower = guess + 1;
+		else
+			upper = guess;
 	}
+
 	return NULL;
 }
 
@@ -1582,7 +1575,6 @@ static int memcmp2(const void *a_buf, const void *b_buf, size_t a_len, size_t b_
 		else
 			return c;
 	}
-
 }
 
 static int rf_flist_entry_cmp(const void *ap, const void *bp) {
@@ -1688,46 +1680,6 @@ static void rf_flist_free(RsyncFetch_t *rf, rf_flist_t **flistp) {
 	}
 }
 
-static int rf_flist_entry_ndx_cmp(const void *ap, const void *bp) {
-	const rf_flist_entry_t *a = *(const rf_flist_entry_t **)ap;
-	const rf_flist_entry_t *b = *(const rf_flist_entry_t **)bp;
-	return AVL_CMP(a->ndx, b->ndx);
-}
-
-static rf_status_t rf_flist_free_except_hardlinks(RsyncFetch_t *rf, rf_flist_t *flist) {
-	if(flist) {
-		rf_flist_entry_t **entries = flist->entries;
-		size_t num = flist->num;
-
-		size_t hardlink_num;
-
-		for(hardlink_num = 0; hardlink_num < num; hardlink_num++) {
-			rf_flist_entry_t *entry = entries[hardlink_num];
-			if(!entry || !entry->is_hardlink_target)
-				break;
-		}
-
-		for(size_t i = hardlink_num + 1; i < num; i++) {
-			rf_flist_entry_t *entry = entries[i];
-			if(entry && entry->is_hardlink_target) {
-				entries[i] = entries[hardlink_num];
-				entries[hardlink_num++] = entry;
-			}
-		}
-
-		qsort(entries, hardlink_num, sizeof *entries, rf_flist_entry_ndx_cmp);
-
-		for(size_t i = 0; i < hardlink_num; i++) {
-			rf_flist_entry_t *entry = entries[i];
-			RF_PROPAGATE_ERROR(rf_hardlink_add(rf, entry->ndx, entry->name));
-		}
-
-		rf_flist_free(rf, &flist);
-	}
-
-	return RF_STATUS_OK;
-}
-
 static rf_status_t rf_flist_add_entry(RsyncFetch_t *rf, rf_flist_t *flist, rf_flist_entry_t *entry) {
 	size_t num = flist->num;
 	size_t size = flist->size;
@@ -1751,7 +1703,7 @@ static rf_status_t rf_flist_add_entry(RsyncFetch_t *rf, rf_flist_t *flist, rf_fl
 	return RF_STATUS_OK;
 }
 
-static rf_status_t rf_fill_flist_entry(RsyncFetch_t *rf, rf_flist_entry_t *entry, uint16_t xflags) {
+static rf_status_t rf_fill_flist_entry(RsyncFetch_t *rf, rf_flist_t *flist, rf_flist_entry_t *entry, uint16_t xflags) {
 	uint8_t b;
 	rf_refstring_t last_name = rf->last.name;
 	size_t len1;
@@ -1790,29 +1742,27 @@ static rf_status_t rf_fill_flist_entry(RsyncFetch_t *rf, rf_flist_entry_t *entry
 
 	rf_refstring_dup(rf, name, &rf->last.name);
 
-	entry->ndx = rf->ndx++;
+	int32_t ndx = rf->ndx++;
 
 	if(xflags & XMIT_HLINK_FIRST) {
 		entry->is_hardlink_target = true;
+		rf_hardlink_add(rf, ndx, name);
 	} else if(xflags & XMIT_HLINKED) {
 		int32_t hlink;
 		RF_PROPAGATE_ERROR(rf_recv_varint(rf, &hlink));
 
-		avl_node_t *node = rf->flists.tail;
-		if(!node)
-			return RF_STATUS_PROTO;
-		rf_flist_t *flist = node->item;
 		if(hlink < flist->offset) {
 			rf_refstring_t hardlink = rf_hardlink_find(rf, hlink);
 			if(!hardlink) {
 				fprintf(stderr, "unable to connect hardlink for %s\n", name);
-				fprintf(stderr, "min_offset = %zu  ndx = %"PRId32"\n", ((rf_flist_t *)rf->flists.head->item)->offset, hlink);
+				fprintf(stderr, "\tndx=%"PRId32" min_offset=%zu\n", hlink, ((rf_flist_t *)rf->flists.head->item)->offset);
 				return RF_STATUS_PROTO;
 			}
+
 			rf_refstring_dup(rf, hardlink, &entry->hardlink);
 		} else {
 			rf_flist_entry_t *hardlink = rf_flist_get_entry(rf, flist, hlink);
-			if(!hardlink)
+			if(!hardlink || !hardlink->is_hardlink_target)
 				return RF_STATUS_PROTO;
 
 			entry->size = hardlink->size;
@@ -1910,7 +1860,7 @@ static rf_status_t rf_fill_flist_entry(RsyncFetch_t *rf, rf_flist_entry_t *entry
 	return RF_STATUS_OK;
 }
 
-static rf_status_t rf_recv_flist_entry(RsyncFetch_t *rf, rf_flist_entry_t **entryp) {
+static rf_status_t rf_recv_flist_entry(RsyncFetch_t *rf, rf_flist_t *flist, rf_flist_entry_t **entryp) {
 	uint8_t b;
 	RF_PROPAGATE_ERROR(rf_recv_uint8(rf, &b));
 	if(!b)
@@ -1934,7 +1884,7 @@ static rf_status_t rf_recv_flist_entry(RsyncFetch_t *rf, rf_flist_entry_t **entr
 		return RF_STATUS_ERRNO;
 	*entry = rf_flist_entry_0;
 
-	rf_status_t s = rf_fill_flist_entry(rf, entry, xflags);
+	rf_status_t s = rf_fill_flist_entry(rf, flist, entry, xflags);
 	if(s != RF_STATUS_OK) {
 		rf_flist_entry_free(rf, entry);
 		return s;
@@ -1949,7 +1899,7 @@ static rf_status_t rf_recv_flist(RsyncFetch_t *rf) {
 
 	for(;;) {
 		rf_flist_entry_t *entry;
-		RF_PROPAGATE_ERROR(rf_recv_flist_entry(rf, &entry));
+		RF_PROPAGATE_ERROR(rf_recv_flist_entry(rf, flist, &entry));
 		if(!entry)
 			break;
 		RF_PROPAGATE_ERROR(rf_flist_add_entry(rf, flist, entry));
@@ -2149,7 +2099,7 @@ static rf_status_t rf_mainloop(RsyncFetch_t *rf) {
 			if(first_flist) {
 				rf_flist_t *flist = first_flist->item;
 				first_flist = first_flist->next;
-				RF_PROPAGATE_ERROR(rf_flist_free_except_hardlinks(rf, flist));
+				rf_flist_free(rf, &flist);
 			}
 			if(!first_flist) {
 				phase++;
