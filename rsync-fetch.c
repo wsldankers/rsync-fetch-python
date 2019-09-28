@@ -32,30 +32,34 @@ static inline void ignore_result(ssize_t r) {
 
 typedef uint64_t nanosecond_t;
 #define NANOSECOND_C(x) UINT64_C(x)
+#define NANOSECONDS NANOSECOND_C(1000000000)
 #define PRIuNANOSECOND PRIu64
 #define PRIxNANOSECOND PRIx64
 #define PRIXNANOSECOND PRIX64
 
 static inline nanosecond_t timespec2nanoseconds(struct timespec *ts) {
-	return (nanosecond_t)ts->tv_sec * NANOSECOND_C(1000000000)
+	return (nanosecond_t)ts->tv_sec * NANOSECONDS
 		+ (nanosecond_t)ts->tv_nsec;
+}
+
+static inline nanosecond_t nanosecond_truncate(nanosecond_t time) {
+	return time - (time % NANOSECONDS + NANOSECONDS) % NANOSECONDS;
 }
 
 __attribute__((unused))
 static inline struct timespec nanoseconds2timespec(nanosecond_t ns) {
 #if 0
 	// signed nanosecond case
-	nanosecond_t tv_nsec = (ns % NANOSECOND_C(1000000000) + NANOSECOND_C(1000000000))
-		% NANOSECOND_C(1000000000);
+	nanosecond_t tv_nsec = (ns % NANOSECONDS + NANOSECONDS) % NANOSECONDS;
 	struct timespec ts = {
-		(ns - tv_nsec) / NANOSECOND_C(1000000000),
+		(ns - tv_nsec) / NANOSECONDS,
 		tv_nsec,
 	};
 #else
 	// unsigned nanosecond case
 	struct timespec ts = {
-		ns / NANOSECOND_C(1000000000),
-		ns % NANOSECOND_C(1000000000),
+		ns / NANOSECONDS,
+		ns % NANOSECONDS,
 	};
 #endif
 	return ts;
@@ -69,7 +73,7 @@ static nanosecond_t nanosecond_get_clock(void) {
 		struct timeval tv;
 		if(gtod_b0rked || gettimeofday(&tv, NULL) == -1) {
 			gtod_b0rked = true;
-			return (nanosecond_t)time(NULL) * NANOSECOND_C(1000000000);
+			return (nanosecond_t)time(NULL) * NANOSECONDS;
 		} else {
 			ts.tv_sec = tv.tv_sec;
 			ts.tv_nsec = tv.tv_usec * (suseconds_t)1000;
@@ -189,6 +193,7 @@ typedef char *rf_refstring_t;
 #define XMIT_GROUP_NAME_FOLLOWS (1 << 11)
 #define XMIT_HLINK_FIRST (1 << 12)
 #define XMIT_IO_ERROR_ENDLIST (1 << 12)
+#define XMIT_MOD_NSEC (1 << 13)
 
 #define ITEM_REPORT_CHANGE (1 << 1)
 #define ITEM_REPORT_SIZE (1 << 2)
@@ -224,6 +229,7 @@ enum message_id {
 
 	// integer type:
 	MSG_IO_ERROR = 22,
+	MSG_ERROR_EXIT = 86,
 	MSG_SUCCESS = 100,
 	MSG_NO_SEND = 102,
 
@@ -234,7 +240,6 @@ enum message_id {
 	MSG_REDO = 9,
 	MSG_FLIST = 20,
 	MSG_FLIST_EOF = 21,
-	MSG_DONE = 86,
 };
 
 typedef enum {
@@ -255,7 +260,7 @@ typedef struct rf_flist_entry {
 	rf_refstring_t hardlink;
 	PyObject *data_callback;
 	int64_t size;
-	int64_t mtime;
+	nanosecond_t mtime;
 	int32_t mode;
 	int32_t uid;
 	int32_t gid;
@@ -328,6 +333,7 @@ typedef struct RsyncFetch {
 	size_t multiplex_in_remaining;
 	size_t multiplex_out_remaining;
 	size_t chunk_size;
+	int protocol;
 	pid_t pid;
 	int32_t ndx;
 	int32_t prev_negative_ndx_in;
@@ -1054,6 +1060,7 @@ static rf_status_t rf_recv_bytes(RsyncFetch_t *rf, char *buf, size_t len) {
 			if(channel == MSG_DATA)
 				break;
 
+			int32_t err;
 			switch(channel) {
 				case MSG_ERROR_XFER:
 				case MSG_INFO:
@@ -1089,11 +1096,16 @@ static rf_status_t rf_recv_bytes(RsyncFetch_t *rf, char *buf, size_t len) {
 					}
 					break;
 				case MSG_IO_ERROR:
-				case MSG_SUCCESS:;
-					int32_t err;
+				case MSG_SUCCESS:
 					if(multiplex_in_remaining != sizeof err)
 						return RF_STATUS_PROTO;
 					RF_PROPAGATE_ERROR(rf_recv_bytes_raw(rf, (char *)&err, sizeof err));
+					break;
+				case MSG_ERROR_EXIT:
+					if(multiplex_in_remaining == sizeof err)
+						RF_PROPAGATE_ERROR(rf_recv_bytes_raw(rf, (char *)&err, sizeof err));
+					else if(multiplex_in_remaining)
+						return RF_STATUS_PROTO;
 					break;
 				case MSG_NO_SEND:
 					if(multiplex_in_remaining != sizeof err)
@@ -1792,7 +1804,13 @@ static rf_status_t rf_fill_flist_entry(RsyncFetch_t *rf, rf_flist_t *flist, rf_f
 	} else {
 		int64_t mtime;
 		RF_PROPAGATE_ERROR(rf_recv_varlong(rf, 4, &mtime));
-		rf->last.mtime = entry->mtime = mtime;
+		rf->last.mtime = entry->mtime = mtime * NANOSECONDS;
+	}
+
+	if(xflags & XMIT_MOD_NSEC) {
+		int32_t mtime_ns;
+		RF_PROPAGATE_ERROR(rf_recv_varint(rf, &mtime_ns));
+		entry->mtime += mtime_ns;
 	}
 
 	int32_t mode;
@@ -1835,7 +1853,7 @@ static rf_status_t rf_fill_flist_entry(RsyncFetch_t *rf, rf_flist_t *flist, rf_f
 		}
 	}
 
-	if(S_ISCHR(mode) || S_ISBLK(mode) || S_ISFIFO(mode) || S_ISSOCK(mode)) {
+	if(S_ISCHR(mode) || S_ISBLK(mode) || ((S_ISFIFO(mode) || S_ISSOCK(mode)) && rf->protocol < 31)) {
 		int32_t major;
 		if(xflags & XMIT_SAME_RDEV_MAJOR) {
 			major = entry->major = rf->last.major;
@@ -2063,7 +2081,8 @@ static rf_status_t rf_mainloop(RsyncFetch_t *rf) {
 	RF_PROPAGATE_ERROR(rf_recv_uint32(rf, &remote_protocol));
 	if(remote_protocol < 30)
 		return RF_STATUS_PROTO;
-	RF_PROPAGATE_ERROR(rf_send_uint32(rf, 30));
+	RF_PROPAGATE_ERROR(rf_send_uint32(rf, 31));
+	rf->protocol = remote_protocol;
 
 	uint8_t cflags;
 	RF_PROPAGATE_ERROR(rf_recv_uint8(rf, &cflags));
@@ -2157,6 +2176,14 @@ static rf_status_t rf_mainloop(RsyncFetch_t *rf) {
 	RF_PROPAGATE_ERROR(rf_recv_varlong(rf, 3, &flist_xfertime));
 
 	RF_PROPAGATE_ERROR(rf_send_ndx(rf, NDX_DONE));
+
+	if(rf->protocol >= 31) {
+		int32_t ndx;
+		RF_PROPAGATE_ERROR(rf_recv_ndx(rf, &ndx));
+		if(ndx != NDX_DONE)
+			return RF_STATUS_PROTO;
+		RF_PROPAGATE_ERROR(rf_send_ndx(rf, NDX_DONE));
+	}
 
 	return rf_wait_for_eof(rf);
 }
