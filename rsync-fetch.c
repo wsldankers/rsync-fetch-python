@@ -171,6 +171,8 @@ typedef char *rf_refstring_t;
 #define RF_BUFNUM_ADJUSTMENT (3)
 #define RF_BUFSIZE_ADJUSTMENT (RF_BUFNUM_ADJUSTMENT * sizeof(void *))
 
+#define RF_KEEPALIVE_INTERVAL (10 * NANOSECONDS)
+
 #define MAX_BLOCK_SIZE 131072
 #define MPLEX_BASE 7
 
@@ -329,6 +331,7 @@ typedef struct RsyncFetch {
 	rf_pipestream_t err_stream;
 	rf_flist_entry_t last;
 	uint64_t timeout;
+	uint64_t keepalive_deadline;
 	size_t hardlinks_num;
 	size_t filters_num;
 	size_t multiplex_in_remaining;
@@ -716,6 +719,161 @@ static rf_status_t rf_flush_output(RsyncFetch_t *rf) {
 	return RF_STATUS_OK;
 }
 
+__attribute__((hot))
+static rf_status_t rf_send_bytes_raw(RsyncFetch_t *rf, const char *src, size_t len) {
+	rf_pipestream_t *stream = &rf->out_stream;
+	size_t fill = stream->fill;
+	size_t size = stream->size;
+	size_t offset = stream->offset;
+	char *buf = stream->buf;
+
+	if(buf) {
+		if(fill + len > size) {
+			size_t newsize = (size + RF_BUFSIZE_ADJUSTMENT) << 1;
+			if(newsize < RF_STREAM_OUT_BUFSIZE)
+				newsize = RF_STREAM_OUT_BUFSIZE;
+			while(fill + len > newsize - RF_BUFSIZE_ADJUSTMENT)
+				newsize <<= 1;
+			newsize -= RF_BUFSIZE_ADJUSTMENT;
+			if(offset) {
+				char *newbuf = malloc(newsize);
+				if(!newbuf)
+					return RF_STATUS_ERRNO;
+				if(offset + fill > size) {
+					size_t amount = size - offset;
+					memcpy(newbuf, buf + offset, amount);
+					memcpy(newbuf + amount, buf, fill - amount);
+				} else {
+					memcpy(newbuf, buf + offset, size);
+				}
+				stream->offset = offset = 0;
+				free(buf);
+				buf = newbuf;
+			} else {
+				buf = realloc(buf, newsize);
+				if(!buf)
+					return RF_STATUS_ERRNO;
+			}
+			stream->buf = buf;
+			stream->size = size = newsize;
+		}
+	} else {
+		size += RF_BUFSIZE_ADJUSTMENT;
+		if(size < RF_STREAM_OUT_BUFSIZE)
+			size = RF_STREAM_OUT_BUFSIZE;
+		while(len > size - RF_BUFSIZE_ADJUSTMENT)
+			size <<= 1;
+		size -= RF_BUFSIZE_ADJUSTMENT;
+		buf = malloc(size);
+		if(!buf)
+			return RF_STATUS_ERRNO;
+		stream->buf = buf;
+		stream->size = size;
+	}
+
+	size_t start = offset + fill;
+	if(start > size)
+		start -= size;
+
+	if(len == 1) {
+		buf[start] = *src;
+	} if(start + len > size) {
+		size_t amount = size - start;
+		memcpy(buf + start, src, amount);
+		memcpy(buf, src + amount, len - amount);
+	} else {
+		memcpy(buf + start, src, len);
+	}
+
+	stream->fill = fill + len;
+
+	return RF_STATUS_OK;
+}
+
+__attribute__((hot))
+static rf_status_t rf_send_bytes(RsyncFetch_t *rf, const char *buf, size_t len) {
+	if(!rf->multiplex) {
+		RF_PROPAGATE_ERROR(rf_flush_output(rf));
+		return rf_send_bytes_raw(rf, buf, len);
+	}
+	size_t multiplex_out_remaining = rf->multiplex_out_remaining;
+	if(multiplex_out_remaining + len >= 0xFFFFFF) {
+		size_t chunk = 0xFFFFFF - multiplex_out_remaining;
+		RF_PROPAGATE_ERROR(rf_send_bytes_raw(rf, buf, chunk));
+		rf->multiplex_out_remaining = 0xFFFFFF;
+		RF_PROPAGATE_ERROR(rf_flush_output(rf));
+
+		buf += chunk;
+		len -= chunk;
+
+		while(len >= 0xFFFFFF) {
+			static const uint8_t mplex[4] = { 0xFF, 0xFF, 0xFF, MSG_DATA + MPLEX_BASE };
+			RF_PROPAGATE_ERROR(rf_send_bytes_raw(rf, (char *)mplex, sizeof mplex));
+			RF_PROPAGATE_ERROR(rf_send_bytes_raw(rf, buf, 0xFFFFFF));
+			len -= 0xFFFFFF;
+			buf += 0xFFFFFF;
+		}
+
+		multiplex_out_remaining = 0;
+	}		
+
+	if(!len)
+		return RF_STATUS_OK;
+
+	if(!multiplex_out_remaining) {
+		static const uint8_t mplex[4] = { 0, 0, 0, MSG_DATA + MPLEX_BASE };
+		RF_PROPAGATE_ERROR(rf_send_bytes_raw(rf, (char *)mplex, sizeof mplex));
+	}
+
+	RF_PROPAGATE_ERROR(rf_send_bytes_raw(rf, buf, len));
+	rf->multiplex_out_remaining = multiplex_out_remaining + len;
+
+	return RF_STATUS_OK;
+}
+
+__attribute__((unused))
+static inline rf_status_t rf_send_int8(RsyncFetch_t *rf, int8_t d) {
+	return rf_send_bytes(rf, (char *)&d, sizeof d);
+}
+
+static inline rf_status_t rf_send_uint8(RsyncFetch_t *rf, uint8_t d) {
+	return rf_send_bytes(rf, (char *)&d, sizeof d);
+}
+
+__attribute__((unused))
+static inline rf_status_t rf_send_int16(RsyncFetch_t *rf, int16_t d) {
+	int16_t le = le16(d);
+	return rf_send_bytes(rf, (char *)&le, sizeof le);
+}
+
+static inline rf_status_t rf_send_uint16(RsyncFetch_t *rf, uint16_t d) {
+	uint16_t le = le16(d);
+	return rf_send_bytes(rf, (char *)&le, sizeof le);
+}
+
+__attribute__((unused))
+static inline rf_status_t rf_send_int32(RsyncFetch_t *rf, int32_t d) {
+	int32_t le = le32(d);
+	return rf_send_bytes(rf, (char *)&le, sizeof le);
+}
+
+static inline rf_status_t rf_send_uint32(RsyncFetch_t *rf, uint32_t d) {
+	uint32_t le = le32(d);
+	return rf_send_bytes(rf, (char *)&le, sizeof le);
+}
+
+__attribute__((unused))
+static inline rf_status_t rf_send_int64(RsyncFetch_t *rf, int64_t d) {
+	int64_t le = le64(d);
+	return rf_send_bytes(rf, (char *)&le, sizeof le);
+}
+
+__attribute__((unused))
+static inline rf_status_t rf_send_uint64(RsyncFetch_t *rf, uint64_t d) {
+	uint64_t le = le64(d);
+	return rf_send_bytes(rf, (char *)&le, sizeof le);
+}
+
 static rf_status_t rf_write_out_stream(RsyncFetch_t *rf) {
 	rf_pipestream_t *stream = &rf->out_stream;
 	size_t fill = stream->fill;
@@ -743,6 +901,9 @@ static rf_status_t rf_write_out_stream(RsyncFetch_t *rf) {
 
 	if(r == -1)
 		return RF_STATUS_ERRNO;
+
+	if(r > 0)
+		rf->keepalive_deadline = nanosecond_get_clock() + RF_KEEPALIVE_INTERVAL;
 
 	fill -= r;
 	if(fill) {
@@ -865,6 +1026,10 @@ static rf_status_t rf_recv_bytes_raw(RsyncFetch_t *rf, char *dst, size_t len) {
 		int timeout = rf->timeout / UINT64_C(1000000);
 
 		for(;;) {
+			if(nanosecond_get_clock() > rf->keepalive_deadline && !out_stream->fill && rf->multiplex) {
+				static const uint8_t mplex[4] = { 0, 0, 0, MSG_DATA + MPLEX_BASE };
+				RF_PROPAGATE_ERROR(rf_send_bytes_raw(rf, (const char *)mplex, sizeof mplex));
+			}
 			struct pollfd pfds[3] = {
 				{ .fd = fd, .events = POLLIN },
 				{ .fd = out_stream->fill ? out_fd : -1, .events = POLLOUT },
@@ -1137,162 +1302,6 @@ static rf_status_t rf_recv_bytes(RsyncFetch_t *rf, char *buf, size_t len) {
 	}
 }
 
-__attribute__((hot))
-static rf_status_t rf_send_bytes_raw(RsyncFetch_t *rf, char *src, size_t len) {
-	rf_pipestream_t *stream = &rf->out_stream;
-	size_t fill = stream->fill;
-	size_t size = stream->size;
-	size_t offset = stream->offset;
-	char *buf = stream->buf;
-
-	if(buf) {
-		if(fill + len > size) {
-			size_t newsize = (size + RF_BUFSIZE_ADJUSTMENT) << 1;
-			if(newsize < RF_STREAM_OUT_BUFSIZE)
-				newsize = RF_STREAM_OUT_BUFSIZE;
-			while(fill + len > newsize - RF_BUFSIZE_ADJUSTMENT)
-				newsize <<= 1;
-			newsize -= RF_BUFSIZE_ADJUSTMENT;
-			if(offset) {
-				char *newbuf = malloc(newsize);
-				if(!newbuf)
-					return RF_STATUS_ERRNO;
-				if(offset + fill > size) {
-					size_t amount = size - offset;
-					memcpy(newbuf, buf + offset, amount);
-					memcpy(newbuf + amount, buf, fill - amount);
-				} else {
-					memcpy(newbuf, buf + offset, size);
-				}
-				stream->offset = offset = 0;
-				free(buf);
-				buf = newbuf;
-			} else {
-				buf = realloc(buf, newsize);
-				if(!buf)
-					return RF_STATUS_ERRNO;
-			}
-			stream->buf = buf;
-			stream->size = size = newsize;
-		}
-	} else {
-		size += RF_BUFSIZE_ADJUSTMENT;
-		if(size < RF_STREAM_OUT_BUFSIZE)
-			size = RF_STREAM_OUT_BUFSIZE;
-		while(len > size - RF_BUFSIZE_ADJUSTMENT)
-			size <<= 1;
-		size -= RF_BUFSIZE_ADJUSTMENT;
-		buf = malloc(size);
-		if(!buf)
-			return RF_STATUS_ERRNO;
-		stream->buf = buf;
-		stream->size = size;
-	}
-
-	size_t start = offset + fill;
-	if(start > size)
-		start -= size;
-
-	if(len == 1) {
-		buf[start] = *src;
-	} if(start + len > size) {
-		size_t amount = size - start;
-		memcpy(buf + start, src, amount);
-		memcpy(buf, src + amount, len - amount);
-	} else {
-		memcpy(buf + start, src, len);
-	}
-
-	stream->fill = fill + len;
-
-	return RF_STATUS_OK;
-}
-
-__attribute__((hot))
-static rf_status_t rf_send_bytes(RsyncFetch_t *rf, char *buf, size_t len) {
-	if(!rf->multiplex) {
-		RF_PROPAGATE_ERROR(rf_flush_output(rf));
-		return rf_send_bytes_raw(rf, buf, len);
-	}
-	size_t multiplex_out_remaining = rf->multiplex_out_remaining;
-	if(multiplex_out_remaining + len >= 0xFFFFFF) {
-		size_t chunk = 0xFFFFFF - multiplex_out_remaining;
-		RF_PROPAGATE_ERROR(rf_send_bytes_raw(rf, buf, chunk));
-		rf->multiplex_out_remaining = 0xFFFFFF;
-		RF_PROPAGATE_ERROR(rf_flush_output(rf));
-
-		buf += chunk;
-		len -= chunk;
-
-		while(len >= 0xFFFFFF) {
-			uint8_t mplex[4] = { 0xFF, 0xFF, 0xFF, MSG_DATA + MPLEX_BASE };
-			RF_PROPAGATE_ERROR(rf_send_bytes_raw(rf, (char *)mplex, sizeof mplex));
-			RF_PROPAGATE_ERROR(rf_send_bytes_raw(rf, buf, 0xFFFFFF));
-			len -= 0xFFFFFF;
-			buf += 0xFFFFFF;
-		}
-
-		multiplex_out_remaining = 0;
-	}		
-
-	if(!len)
-		return RF_STATUS_OK;
-
-	if(!multiplex_out_remaining) {
-		uint8_t mplex[4] = { 0, 0, 0, MSG_DATA + MPLEX_BASE };
-		RF_PROPAGATE_ERROR(rf_send_bytes_raw(rf, (char *)mplex, sizeof mplex));
-	}
-
-	RF_PROPAGATE_ERROR(rf_send_bytes_raw(rf, buf, len));
-	rf->multiplex_out_remaining = multiplex_out_remaining + len;
-
-	return RF_STATUS_OK;
-}
-
-__attribute__((unused))
-static inline rf_status_t rf_send_int8(RsyncFetch_t *rf, int8_t d) {
-	return rf_send_bytes(rf, (char *)&d, sizeof d);
-}
-
-static inline rf_status_t rf_send_uint8(RsyncFetch_t *rf, uint8_t d) {
-	return rf_send_bytes(rf, (char *)&d, sizeof d);
-}
-
-__attribute__((unused))
-static inline rf_status_t rf_send_int16(RsyncFetch_t *rf, int16_t d) {
-	int16_t le = le16(d);
-	return rf_send_bytes(rf, (char *)&le, sizeof le);
-}
-
-static inline rf_status_t rf_send_uint16(RsyncFetch_t *rf, uint16_t d) {
-	uint16_t le = le16(d);
-	return rf_send_bytes(rf, (char *)&le, sizeof le);
-}
-
-__attribute__((unused))
-static inline rf_status_t rf_send_int32(RsyncFetch_t *rf, int32_t d) {
-	int32_t le = le32(d);
-	return rf_send_bytes(rf, (char *)&le, sizeof le);
-}
-
-static inline rf_status_t rf_send_uint32(RsyncFetch_t *rf, uint32_t d) {
-	uint32_t le = le32(d);
-	return rf_send_bytes(rf, (char *)&le, sizeof le);
-}
-
-__attribute__((unused))
-static inline rf_status_t rf_send_int64(RsyncFetch_t *rf, int64_t d) {
-	int64_t le = le64(d);
-	return rf_send_bytes(rf, (char *)&le, sizeof le);
-}
-
-__attribute__((unused))
-static inline rf_status_t rf_send_uint64(RsyncFetch_t *rf, uint64_t d) {
-	uint64_t le = le64(d);
-	return rf_send_bytes(rf, (char *)&le, sizeof le);
-}
-
-__attribute__((unused))
 static inline rf_status_t rf_recv_int8(RsyncFetch_t *rf, int8_t *d) {
 	return rf_recv_bytes(rf, (char *)d, sizeof *d);
 }
@@ -2092,6 +2101,7 @@ static rf_status_t rf_mainloop(RsyncFetch_t *rf) {
 	RF_PROPAGATE_ERROR(rf_recv_uint32(rf, &checksum_seed));
 
 	rf->multiplex = true;
+	rf->keepalive_deadline = nanosecond_get_clock() + RF_KEEPALIVE_INTERVAL;
 
 	char **filters = rf->filters;
 	if(filters) {
