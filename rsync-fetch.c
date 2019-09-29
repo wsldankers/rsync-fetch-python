@@ -158,7 +158,7 @@ typedef struct rf_pipestream {
 __attribute__((unused))
 static const rf_pipestream_t rf_pipestream_0 = PIPESTREAM_INITIALIZER;
 
-struct refstring_header {
+struct rf_refstring_header {
 	size_t len;
 	size_t refcount;
 };
@@ -290,10 +290,30 @@ typedef struct rf_hardlinks {
 #define RF_HARDLINKS_BUFSIZE (65536 - RF_BUFSIZE_ADJUSTMENT)
 #define RF_HARDLINKS_SIZE ((RF_HARDLINKS_BUFSIZE - sizeof(avl_node_t)) / sizeof(rf_hardlinks_t))
 
-#define RF_PROPAGATE_ERROR(x) do { rf_status_t __rf_propagate_error = (x); if(__rf_propagate_error != RF_STATUS_OK) return __rf_propagate_error; } while(false)
-//define RF_PROPAGATE_ERROR(x) do { rf_status_t __rf_propagate_error = (x); if(__rf_propagate_error != RF_STATUS_OK) { if(__rf_propagate_error == RF_STATUS_PROTO) fprintf(stderr, "%s:%d: protocol error propagated by %s()\n", __FILE__, __LINE__, __func__); return __rf_propagate_error; } } while(false)
+#if 0
 
-//define RF_RETURN_ERROR(x) do { rf_status_t __rf_return_error = (x); if(__rf_return_error == RF_STATUS_PROTO) fprintf(stderr, "%s:%d: protocol error returned by %s()\n", __FILE__, __LINE__, __func__); return __rf_return_error; } while(false)
+#define RF_PROPAGATE_STATUS(x) return (x)
+#define RF_PROPAGATE_ERROR(x) do { rf_status_t __rf_propagate_error = (x); if(__rf_propagate_error != RF_STATUS_OK) return __rf_propagate_error; } while(false)
+#define RF_RETURN_STATUS(x) return (x)
+
+#else
+
+static const char *rf_status_names[] = {
+	"RF_STATUS_OK",
+	"RF_STATUS_ERRNO",
+	"RF_STATUS_PYTHON",
+	"RF_STATUS_TIMEOUT",
+	"RF_STATUS_HANGUP",
+	"RF_STATUS_ASSERT",
+	"RF_STATUS_PROTO",
+	"RF_STATUS_EXIT",
+};
+
+#define RF_PROPAGATE_STATUS(x) do { rf_status_t __rf_propagate_error = (x); if(__rf_propagate_error != RF_STATUS_OK) fprintf(stderr, "%s:%d: %s propagated by %s()\n", __FILE__, __LINE__, rf_status_names[__rf_propagate_error], __func__); return __rf_propagate_error; } while(false)
+#define RF_PROPAGATE_ERROR(x) do { rf_status_t __rf_propagate_error = (x); if(__rf_propagate_error != RF_STATUS_OK) { fprintf(stderr, "%s:%d: %s propagated by %s()\n", __FILE__, __LINE__, rf_status_names[__rf_propagate_error], __func__); return __rf_propagate_error; } } while(false)
+#define RF_RETURN_STATUS(x) do { rf_status_t __rf_return_error = (x); if(__rf_return_error != RF_STATUS_OK) fprintf(stderr, "%s:%d: %s returned by %s()\n", __FILE__, __LINE__, rf_status_names[__rf_return_error], __func__); return __rf_return_error; } while(false)
+
+#endif
 
 #define RSYNCFETCH_MAGIC UINT64_C(0x6FB32179D3F495D0)
 
@@ -455,7 +475,7 @@ static inline void rf_release_lock(RsyncFetch_t *rf) {}
 #endif
 
 static inline size_t rf_refstring_len(const rf_refstring_t str) {
-	return str ? ((struct refstring_header *)str)[-1].len : 0;
+	return str ? ((struct rf_refstring_header *)str)[-1].len : 0;
 }
 
 static void rf_refstring_free(RsyncFetch_t *rf, rf_refstring_t *strp) {
@@ -463,7 +483,7 @@ static void rf_refstring_free(RsyncFetch_t *rf, rf_refstring_t *strp) {
 		char *str = *strp;
 		if(str) {
 			*strp = NULL;
-			struct refstring_header *h = (struct refstring_header *)str - 1;
+			struct rf_refstring_header *h = (struct rf_refstring_header *)str - 1;
 			size_t refcount = h->refcount;
 			if(refcount == 1)
 				free(h);
@@ -474,9 +494,9 @@ static void rf_refstring_free(RsyncFetch_t *rf, rf_refstring_t *strp) {
 }
 
 static rf_status_t rf_refstring_newlen(RsyncFetch_t *rf, const char *src, size_t len, rf_refstring_t *strp) {
-	struct refstring_header *h = malloc(sizeof *h + len + 1);
+	struct rf_refstring_header *h = malloc(sizeof *h + len + 1);
 	if(!h)
-		return RF_STATUS_ERRNO;
+		RF_RETURN_STATUS(RF_STATUS_ERRNO);
 	h->len = len;
 	h->refcount = 1;
 	rf_refstring_t str = (rf_refstring_t)(h + 1);
@@ -498,7 +518,7 @@ static rf_status_t rf_refstring_new(RsyncFetch_t *rf, const char *src, rf_refstr
 static void rf_refstring_dup(RsyncFetch_t *rf, rf_refstring_t str, rf_refstring_t *strp) {
 	rf_refstring_free(rf, strp);
 	if(str) {
-		struct refstring_header *h = (struct refstring_header *)str - 1;
+		struct rf_refstring_header *h = (struct rf_refstring_header *)str - 1;
 		h->refcount++;
 		if(strp)
 			*strp = str;
@@ -511,7 +531,7 @@ static rf_status_t rf_ensure_bytes(RsyncFetch_t *rf, PyObject *obj, PyObject **b
 	if(PyUnicode_Check(obj)) {
 		PyObject *bytes = PyUnicode_AsEncodedString(obj, "UTF-8", "surrogateescape");
 		if(!bytes)
-			return RF_STATUS_PYTHON;
+			RF_RETURN_STATUS(RF_STATUS_PYTHON);
 		*bytesp = bytes;
 	} else if(PyBytes_Check(obj)) {
 		Py_IncRef(obj);
@@ -519,11 +539,11 @@ static rf_status_t rf_ensure_bytes(RsyncFetch_t *rf, PyObject *obj, PyObject **b
 	} else {
 		PyObject *bytes = PyBytes_FromObject(obj);
 		if(!bytes)
-			return RF_STATUS_PYTHON;
+			RF_RETURN_STATUS(RF_STATUS_PYTHON);
 		*bytesp = bytes;
 	}
 
-	return RF_STATUS_OK;
+	RF_RETURN_STATUS(RF_STATUS_OK);
 }
 
 static rf_status_t rf_iterate(RsyncFetch_t *rf, PyObject *iterable, char ***listp, size_t *countp) {
@@ -531,7 +551,7 @@ static rf_status_t rf_iterate(RsyncFetch_t *rf, PyObject *iterable, char ***list
 
 	PyObject *iterator = PyObject_GetIter(iterable);
 	if(!iterator)
-		return RF_STATUS_PYTHON;
+		RF_RETURN_STATUS(RF_STATUS_PYTHON);
 
 	rf_status_t s = RF_STATUS_OK;
 
@@ -631,7 +651,7 @@ static rf_status_t rf_iterate(RsyncFetch_t *rf, PyObject *iterable, char ***list
 	}
 	Py_DecRef(iterator);
 
-	return s;
+	RF_RETURN_STATUS(s);
 }
 
 static rf_flist_entry_t *rf_flist_get_entry(RsyncFetch_t *rf, rf_flist_t *flist, int32_t ndx) {
@@ -716,7 +736,7 @@ static rf_status_t rf_flush_output(RsyncFetch_t *rf) {
 		
 		rf->multiplex_out_remaining = 0;
 	}
-	return RF_STATUS_OK;
+	RF_RETURN_STATUS(RF_STATUS_OK);
 }
 
 __attribute__((hot))
@@ -738,7 +758,7 @@ static rf_status_t rf_send_bytes_raw(RsyncFetch_t *rf, const char *src, size_t l
 			if(offset) {
 				char *newbuf = malloc(newsize);
 				if(!newbuf)
-					return RF_STATUS_ERRNO;
+					RF_RETURN_STATUS(RF_STATUS_ERRNO);
 				if(offset + fill > size) {
 					size_t amount = size - offset;
 					memcpy(newbuf, buf + offset, amount);
@@ -752,7 +772,7 @@ static rf_status_t rf_send_bytes_raw(RsyncFetch_t *rf, const char *src, size_t l
 			} else {
 				buf = realloc(buf, newsize);
 				if(!buf)
-					return RF_STATUS_ERRNO;
+					RF_RETURN_STATUS(RF_STATUS_ERRNO);
 			}
 			stream->buf = buf;
 			stream->size = size = newsize;
@@ -766,7 +786,7 @@ static rf_status_t rf_send_bytes_raw(RsyncFetch_t *rf, const char *src, size_t l
 		size -= RF_BUFSIZE_ADJUSTMENT;
 		buf = malloc(size);
 		if(!buf)
-			return RF_STATUS_ERRNO;
+			RF_RETURN_STATUS(RF_STATUS_ERRNO);
 		stream->buf = buf;
 		stream->size = size;
 	}
@@ -787,14 +807,14 @@ static rf_status_t rf_send_bytes_raw(RsyncFetch_t *rf, const char *src, size_t l
 
 	stream->fill = fill + len;
 
-	return RF_STATUS_OK;
+	RF_RETURN_STATUS(RF_STATUS_OK);
 }
 
 __attribute__((hot))
 static rf_status_t rf_send_bytes(RsyncFetch_t *rf, const char *buf, size_t len) {
 	if(!rf->multiplex) {
 		RF_PROPAGATE_ERROR(rf_flush_output(rf));
-		return rf_send_bytes_raw(rf, buf, len);
+		RF_PROPAGATE_STATUS(rf_send_bytes_raw(rf, buf, len));
 	}
 	size_t multiplex_out_remaining = rf->multiplex_out_remaining;
 	if(multiplex_out_remaining + len >= 0xFFFFFF) {
@@ -818,7 +838,7 @@ static rf_status_t rf_send_bytes(RsyncFetch_t *rf, const char *buf, size_t len) 
 	}		
 
 	if(!len)
-		return RF_STATUS_OK;
+		RF_RETURN_STATUS(RF_STATUS_OK);
 
 	if(!multiplex_out_remaining) {
 		static const uint8_t mplex[4] = { 0, 0, 0, MSG_DATA + MPLEX_BASE };
@@ -828,50 +848,50 @@ static rf_status_t rf_send_bytes(RsyncFetch_t *rf, const char *buf, size_t len) 
 	RF_PROPAGATE_ERROR(rf_send_bytes_raw(rf, buf, len));
 	rf->multiplex_out_remaining = multiplex_out_remaining + len;
 
-	return RF_STATUS_OK;
+	RF_RETURN_STATUS(RF_STATUS_OK);
 }
 
 __attribute__((unused))
 static inline rf_status_t rf_send_int8(RsyncFetch_t *rf, int8_t d) {
-	return rf_send_bytes(rf, (char *)&d, sizeof d);
+	RF_PROPAGATE_STATUS(rf_send_bytes(rf, (char *)&d, sizeof d));
 }
 
 static inline rf_status_t rf_send_uint8(RsyncFetch_t *rf, uint8_t d) {
-	return rf_send_bytes(rf, (char *)&d, sizeof d);
+	RF_PROPAGATE_STATUS(rf_send_bytes(rf, (char *)&d, sizeof d));
 }
 
 __attribute__((unused))
 static inline rf_status_t rf_send_int16(RsyncFetch_t *rf, int16_t d) {
 	int16_t le = le16(d);
-	return rf_send_bytes(rf, (char *)&le, sizeof le);
+	RF_PROPAGATE_STATUS(rf_send_bytes(rf, (char *)&le, sizeof le));
 }
 
 static inline rf_status_t rf_send_uint16(RsyncFetch_t *rf, uint16_t d) {
 	uint16_t le = le16(d);
-	return rf_send_bytes(rf, (char *)&le, sizeof le);
+	RF_PROPAGATE_STATUS(rf_send_bytes(rf, (char *)&le, sizeof le));
 }
 
 __attribute__((unused))
 static inline rf_status_t rf_send_int32(RsyncFetch_t *rf, int32_t d) {
 	int32_t le = le32(d);
-	return rf_send_bytes(rf, (char *)&le, sizeof le);
+	RF_PROPAGATE_STATUS(rf_send_bytes(rf, (char *)&le, sizeof le));
 }
 
 static inline rf_status_t rf_send_uint32(RsyncFetch_t *rf, uint32_t d) {
 	uint32_t le = le32(d);
-	return rf_send_bytes(rf, (char *)&le, sizeof le);
+	RF_PROPAGATE_STATUS(rf_send_bytes(rf, (char *)&le, sizeof le));
 }
 
 __attribute__((unused))
 static inline rf_status_t rf_send_int64(RsyncFetch_t *rf, int64_t d) {
 	int64_t le = le64(d);
-	return rf_send_bytes(rf, (char *)&le, sizeof le);
+	RF_PROPAGATE_STATUS(rf_send_bytes(rf, (char *)&le, sizeof le));
 }
 
 __attribute__((unused))
 static inline rf_status_t rf_send_uint64(RsyncFetch_t *rf, uint64_t d) {
 	uint64_t le = le64(d);
-	return rf_send_bytes(rf, (char *)&le, sizeof le);
+	RF_PROPAGATE_STATUS(rf_send_bytes(rf, (char *)&le, sizeof le));
 }
 
 static rf_status_t rf_write_out_stream(RsyncFetch_t *rf) {
@@ -900,7 +920,7 @@ static rf_status_t rf_write_out_stream(RsyncFetch_t *rf) {
 	}
 
 	if(r == -1)
-		return RF_STATUS_ERRNO;
+		RF_RETURN_STATUS(RF_STATUS_ERRNO);
 
 	if(r > 0)
 		rf->keepalive_deadline = nanosecond_get_clock() + RF_KEEPALIVE_INTERVAL;
@@ -917,7 +937,7 @@ static rf_status_t rf_write_out_stream(RsyncFetch_t *rf) {
 		stream->offset = 0;
 	}
 
-	return RF_STATUS_OK;
+	RF_RETURN_STATUS(RF_STATUS_OK);
 }
 
 static rf_status_t rf_read_error_stream(RsyncFetch_t *rf) {
@@ -930,7 +950,7 @@ static rf_status_t rf_read_error_stream(RsyncFetch_t *rf) {
 		size = RF_STREAM_ERR_BUFSIZE - RF_BUFSIZE_ADJUSTMENT;
 		buf = malloc(size);
 		if(!buf)
-			return RF_STATUS_ERRNO;
+			RF_RETURN_STATUS(RF_STATUS_ERRNO);
 		stream->buf = buf;
 		stream->size = size;
 	}
@@ -940,7 +960,7 @@ static rf_status_t rf_read_error_stream(RsyncFetch_t *rf) {
 	char *old_buf_end = buf + fill;
 	ssize_t r = read(stream->fd, old_buf_end, size - fill);
 	if(r == -1)
-		return RF_STATUS_ERRNO;
+		RF_RETURN_STATUS(RF_STATUS_ERRNO);
 
 	char *new_buf_end = old_buf_end + r;
 	char *todo = buf;
@@ -950,12 +970,12 @@ static rf_status_t rf_read_error_stream(RsyncFetch_t *rf) {
 			rf_block_threads(rf);
 			PyObject *result = PyObject_CallFunction(error_callback, "y#", todo, (Py_ssize_t)(eol - todo));
 			if(!result)
-				return RF_STATUS_PYTHON;
+				RF_RETURN_STATUS(RF_STATUS_PYTHON);
 			Py_DecRef(result);
 		} else {
 			rf_unblock_threads(rf);
 			if(write(STDERR_FILENO, todo, eol - todo) == -1)
-				return RF_STATUS_ERRNO;
+				RF_RETURN_STATUS(RF_STATUS_ERRNO);
 		}
 
 		todo = eol;
@@ -972,16 +992,16 @@ static rf_status_t rf_read_error_stream(RsyncFetch_t *rf) {
 			rf_block_threads(rf);
 			PyObject *result = PyObject_CallFunction(error_callback, "y#", buf, size);
 			if(!result)
-				return RF_STATUS_PYTHON;
+				RF_RETURN_STATUS(RF_STATUS_PYTHON);
 			Py_DecRef(result);
 		} else {
 			rf_unblock_threads(rf);
 			if(write(STDERR_FILENO, buf, size) == -1)
-				return RF_STATUS_ERRNO;
+				RF_RETURN_STATUS(RF_STATUS_ERRNO);
 		}
 	}
 
-	return RF_STATUS_OK;
+	RF_RETURN_STATUS(RF_STATUS_OK);
 }
 
 __attribute__((hot))
@@ -998,7 +1018,7 @@ static rf_status_t rf_recv_bytes_raw(RsyncFetch_t *rf, char *dst, size_t len) {
 		size = RF_STREAM_IN_BUFSIZE - RF_BUFSIZE_ADJUSTMENT;
 		buf = malloc(size);
 		if(!buf)
-			return RF_STATUS_ERRNO;
+			RF_RETURN_STATUS(RF_STATUS_ERRNO);
 		stream->buf = buf;
 		stream->size = size;
 	}
@@ -1038,15 +1058,15 @@ static rf_status_t rf_recv_bytes_raw(RsyncFetch_t *rf, char *dst, size_t len) {
 
 			int r = poll(pfds, orz(pfds), timeout);
 			if(r == -1)
-				return RF_STATUS_ERRNO;
+				RF_RETURN_STATUS(RF_STATUS_ERRNO);
 			if(r == 0)
-				return RF_STATUS_TIMEOUT;
+				RF_RETURN_STATUS(RF_STATUS_TIMEOUT);
 
 			if(pfds[RF_STREAM_IN].revents & (POLLERR|POLLHUP))
-				return RF_STATUS_HANGUP;
+				RF_RETURN_STATUS(RF_STATUS_HANGUP);
 
 			if(pfds[RF_STREAM_OUT].revents & (POLLERR|POLLHUP))
-				return RF_STATUS_HANGUP;
+				RF_RETURN_STATUS(RF_STATUS_HANGUP);
 
 			if(pfds[RF_STREAM_ERR].revents & (POLLERR|POLLHUP)) {
 				close(err_fd);
@@ -1070,13 +1090,13 @@ static rf_status_t rf_recv_bytes_raw(RsyncFetch_t *rf, char *dst, size_t len) {
 				};
 				ssize_t r = readv(fd, iov, orz(iov));
 				if(r == -1)
-					return RF_STATUS_ERRNO;
+					RF_RETURN_STATUS(RF_STATUS_ERRNO);
 				if(r < len) {
 					dst += r;
 					len -= r;
 				} else {
 					stream->fill = r - len;
-					return RF_STATUS_OK;
+					RF_RETURN_STATUS(RF_STATUS_OK);
 				}
 			}
 		}
@@ -1101,7 +1121,7 @@ static rf_status_t rf_recv_bytes_raw(RsyncFetch_t *rf, char *dst, size_t len) {
 		}
 	}
 
-	return RF_STATUS_OK;
+	RF_RETURN_STATUS(RF_STATUS_OK);
 }
 
 static rf_status_t rf_wait_for_eof(RsyncFetch_t *rf) {
@@ -1117,7 +1137,7 @@ static rf_status_t rf_wait_for_eof(RsyncFetch_t *rf) {
 
 	for(;;) {
 		if(stream->fill)
-			return RF_STATUS_PROTO;
+			RF_RETURN_STATUS(RF_STATUS_PROTO);
 
 		struct pollfd pfds[3] = {
 			{ .fd = fd, .events = POLLIN },
@@ -1127,9 +1147,9 @@ static rf_status_t rf_wait_for_eof(RsyncFetch_t *rf) {
 
 		int r = poll(pfds, orz(pfds), timeout);
 		if(r == -1)
-			return RF_STATUS_ERRNO;
+			RF_RETURN_STATUS(RF_STATUS_ERRNO);
 		if(r == 0)
-			return RF_STATUS_TIMEOUT;
+			RF_RETURN_STATUS(RF_STATUS_TIMEOUT);
 
 		if(pfds[RF_STREAM_ERR].revents & POLLIN)
 			RF_PROPAGATE_ERROR(rf_read_error_stream(rf));
@@ -1138,7 +1158,7 @@ static rf_status_t rf_wait_for_eof(RsyncFetch_t *rf) {
 			RF_PROPAGATE_ERROR(rf_write_out_stream(rf));
 
 		if(pfds[RF_STREAM_IN].revents & POLLIN)
-			return RF_STATUS_PROTO;
+			RF_RETURN_STATUS(RF_STATUS_PROTO);
 
 		if(pfds[RF_STREAM_ERR].revents & (POLLERR|POLLHUP)) {
 			close(err_fd);
@@ -1153,7 +1173,7 @@ static rf_status_t rf_wait_for_eof(RsyncFetch_t *rf) {
 		if(pfds[RF_STREAM_IN].revents & (POLLERR|POLLHUP)) {
 			close(fd);
 			stream->fd = -1;
-			return RF_STATUS_OK;
+			RF_RETURN_STATUS(RF_STATUS_OK);
 		}
 	}
 }
@@ -1202,7 +1222,7 @@ static void rf_drain_error_stream(RsyncFetch_t *rf, nanosecond_t deadline) {
 __attribute__((hot))
 static rf_status_t rf_recv_bytes(RsyncFetch_t *rf, char *buf, size_t len) {
 	if(!rf->multiplex)
-		return rf_recv_bytes_raw(rf, buf, len);
+		RF_PROPAGATE_STATUS(rf_recv_bytes_raw(rf, buf, len));
 
 	size_t multiplex_in_remaining = rf->multiplex_in_remaining;
 	for(;;) {
@@ -1214,7 +1234,7 @@ static rf_status_t rf_recv_bytes(RsyncFetch_t *rf, char *buf, size_t len) {
 			}
 		} else {
 			rf->multiplex_in_remaining = multiplex_in_remaining - len;
-			return rf_recv_bytes_raw(rf, buf, len);
+			RF_PROPAGATE_STATUS(rf_recv_bytes_raw(rf, buf, len));
 		}
 
 		for(;;) {
@@ -1237,11 +1257,11 @@ static rf_status_t rf_recv_bytes(RsyncFetch_t *rf, char *buf, size_t len) {
 					if(multiplex_in_remaining) {
 						char *message = malloc(multiplex_in_remaining);
 						if(!message)
-							return RF_STATUS_ERRNO;
+							RF_RETURN_STATUS(RF_STATUS_ERRNO);
 						rf_status_t e = rf_recv_bytes_raw(rf, message, multiplex_in_remaining);
 						if(e != RF_STATUS_OK) {
 							free(message);
-							return e;
+							RF_PROPAGATE_STATUS(e);
 						}
 
 						PyObject *error_callback = rf->error_callback;
@@ -1251,7 +1271,7 @@ static rf_status_t rf_recv_bytes(RsyncFetch_t *rf, char *buf, size_t len) {
 								message, multiplex_in_remaining, channel);
 							free(message);
 							if(!result)
-								return RF_STATUS_PYTHON;
+								RF_RETURN_STATUS(RF_STATUS_PYTHON);
 							Py_DecRef(result);
 						} else {
 							rf_unblock_threads(rf);
@@ -1264,18 +1284,18 @@ static rf_status_t rf_recv_bytes(RsyncFetch_t *rf, char *buf, size_t len) {
 				case MSG_IO_ERROR:
 				case MSG_SUCCESS:
 					if(multiplex_in_remaining != sizeof err)
-						return RF_STATUS_PROTO;
+						RF_RETURN_STATUS(RF_STATUS_PROTO);
 					RF_PROPAGATE_ERROR(rf_recv_bytes_raw(rf, (char *)&err, sizeof err));
 					break;
 				case MSG_ERROR_EXIT:
 					if(multiplex_in_remaining == sizeof err)
 						RF_PROPAGATE_ERROR(rf_recv_bytes_raw(rf, (char *)&err, sizeof err));
 					else if(multiplex_in_remaining)
-						return RF_STATUS_PROTO;
-					return RF_STATUS_EXIT;
+						RF_RETURN_STATUS(RF_STATUS_PROTO);
+					RF_RETURN_STATUS(RF_STATUS_EXIT);
 				case MSG_NO_SEND:
 					if(multiplex_in_remaining != sizeof err)
-						return RF_STATUS_PROTO;
+						RF_RETURN_STATUS(RF_STATUS_PROTO);
 					RF_PROPAGATE_ERROR(rf_recv_bytes_raw(rf, (char *)&err, sizeof err));
 					rf_flist_entry_t *entry = rf_find_ndx(rf, le32(err));
 					if(entry) {
@@ -1286,28 +1306,28 @@ static rf_status_t rf_recv_bytes(RsyncFetch_t *rf, char *buf, size_t len) {
 							entry->data_callback = NULL;
 							Py_DecRef(data_callback);
 							if(!result)
-								return RF_STATUS_PYTHON;
+								RF_RETURN_STATUS(RF_STATUS_PYTHON);
 							Py_DecRef(result);
 						}
 					}
 					break;
 				case MSG_NOOP:
 					if(multiplex_in_remaining)
-						return RF_STATUS_PROTO;
+						RF_RETURN_STATUS(RF_STATUS_PROTO);
 					break;
 				default:
-					return RF_STATUS_PROTO;
+					RF_RETURN_STATUS(RF_STATUS_PROTO);
 			}
 		}
 	}
 }
 
 static inline rf_status_t rf_recv_int8(RsyncFetch_t *rf, int8_t *d) {
-	return rf_recv_bytes(rf, (char *)d, sizeof *d);
+	RF_PROPAGATE_STATUS(rf_recv_bytes(rf, (char *)d, sizeof *d));
 }
 
 static inline rf_status_t rf_recv_uint8(RsyncFetch_t *rf, uint8_t *d) {
-	return rf_recv_bytes(rf, (char *)d, sizeof *d);
+	RF_PROPAGATE_STATUS(rf_recv_bytes(rf, (char *)d, sizeof *d));
 }
 
 __attribute__((unused))
@@ -1315,28 +1335,28 @@ static inline rf_status_t rf_recv_int16(RsyncFetch_t *rf, int16_t *d) {
 	int16_t le;
 	RF_PROPAGATE_ERROR(rf_recv_bytes(rf, (char *)&le, sizeof le));
 	*d = le16(le);
-	return RF_STATUS_OK;
+	RF_RETURN_STATUS(RF_STATUS_OK);
 }
 
 static inline rf_status_t rf_recv_uint16(RsyncFetch_t *rf, uint16_t *d) {
 	uint16_t le;
 	RF_PROPAGATE_ERROR(rf_recv_bytes(rf, (char *)&le, sizeof le));
 	*d = le16(le);
-	return RF_STATUS_OK;
+	RF_RETURN_STATUS(RF_STATUS_OK);
 }
 
 static inline rf_status_t rf_recv_int32(RsyncFetch_t *rf, int32_t *d) {
 	int32_t le;
 	RF_PROPAGATE_ERROR(rf_recv_bytes(rf, (char *)&le, sizeof le));
 	*d = le32(le);
-	return RF_STATUS_OK;
+	RF_RETURN_STATUS(RF_STATUS_OK);
 }
 
 static inline rf_status_t rf_recv_uint32(RsyncFetch_t *rf, uint32_t *d) {
 	uint32_t le;
 	RF_PROPAGATE_ERROR(rf_recv_bytes(rf, (char *)&le, sizeof le));
 	*d = le32(le);
-	return RF_STATUS_OK;
+	RF_RETURN_STATUS(RF_STATUS_OK);
 }
 
 __attribute__((unused))
@@ -1344,7 +1364,7 @@ static inline rf_status_t rf_recv_int64(RsyncFetch_t *rf, int64_t *d) {
 	int64_t le;
 	RF_PROPAGATE_ERROR(rf_recv_bytes(rf, (char *)&le, sizeof le));
 	*d = le64(le);
-	return RF_STATUS_OK;
+	RF_RETURN_STATUS(RF_STATUS_OK);
 }
 
 __attribute__((unused))
@@ -1352,7 +1372,7 @@ static inline rf_status_t rf_recv_uint64(RsyncFetch_t *rf, uint64_t *d) {
 	uint64_t le;
 	RF_PROPAGATE_ERROR(rf_recv_bytes(rf, (char *)&le, sizeof le));
 	*d = le64(le);
-	return RF_STATUS_OK;
+	RF_RETURN_STATUS(RF_STATUS_OK);
 }
 
 static const uint8_t rf_varint_extra[] = {
@@ -1374,7 +1394,7 @@ static rf_status_t rf_recv_varint(RsyncFetch_t *rf, int32_t *d) {
 		} buf = { .bytes = {0} };
 
 		if(extra > sizeof buf.bytes)
-			return RF_STATUS_PROTO;
+			RF_RETURN_STATUS(RF_STATUS_PROTO);
 
 		RF_PROPAGATE_ERROR(rf_recv_bytes(rf, buf.bytes, extra));
 
@@ -1385,7 +1405,7 @@ static rf_status_t rf_recv_varint(RsyncFetch_t *rf, int32_t *d) {
 	} else {
 		*d = initial;
 	}
-	return RF_STATUS_OK;
+	RF_RETURN_STATUS(RF_STATUS_OK);
 }
 
 static rf_status_t rf_recv_varlong(RsyncFetch_t *rf, size_t min_bytes, int64_t *d) {
@@ -1396,7 +1416,7 @@ static rf_status_t rf_recv_varlong(RsyncFetch_t *rf, size_t min_bytes, int64_t *
 
 	min_bytes--;
 	if(min_bytes > sizeof buf.bytes)
-		return RF_STATUS_ASSERT;
+		RF_RETURN_STATUS(RF_STATUS_ASSERT);
 
 	uint8_t initial;
 	RF_PROPAGATE_ERROR(rf_recv_uint8(rf, &initial));
@@ -1404,7 +1424,7 @@ static rf_status_t rf_recv_varlong(RsyncFetch_t *rf, size_t min_bytes, int64_t *
 	size_t extra = rf_varint_extra[initial >> 2];
 	size_t total = min_bytes + extra;
 	if(total > sizeof buf.bytes)
-		return RF_STATUS_PROTO;
+		RF_RETURN_STATUS(RF_STATUS_PROTO);
 
 	RF_PROPAGATE_ERROR(rf_recv_bytes(rf, buf.bytes, total));
 
@@ -1413,7 +1433,7 @@ static rf_status_t rf_recv_varlong(RsyncFetch_t *rf, size_t min_bytes, int64_t *
 
 	*d = le64(buf.int64);
 
-	return RF_STATUS_OK;
+	RF_RETURN_STATUS(RF_STATUS_OK);
 }
 
 static rf_status_t rf_recv_ndx(RsyncFetch_t *rf, int32_t *d) {
@@ -1429,7 +1449,8 @@ static rf_status_t rf_recv_ndx(RsyncFetch_t *rf, int32_t *d) {
 		prev_ptr = &rf->prev_positive_ndx_in;
 		is_positive = true;
 	} else {
-		return *d = NDX_DONE, RF_STATUS_OK;
+		*d = NDX_DONE;
+		RF_RETURN_STATUS(RF_STATUS_OK);
 	}
 
 	int32_t ndx;
@@ -1453,13 +1474,13 @@ static rf_status_t rf_recv_ndx(RsyncFetch_t *rf, int32_t *d) {
 
 	*prev_ptr = ndx;
 	*d = is_positive ? ndx : -ndx;
-	return RF_STATUS_OK;
+	RF_RETURN_STATUS(RF_STATUS_OK);
 }
 
 static rf_status_t rf_send_ndx(RsyncFetch_t *rf, int32_t ndx) {
 	int32_t diff;
 	if(ndx == NDX_DONE) {
-		return rf_send_uint8(rf, 0);
+		RF_PROPAGATE_STATUS(rf_send_uint8(rf, 0));
 	} else if(ndx >= 0) {
 		diff = ndx - rf->prev_positive_ndx_out;
 		rf->prev_positive_ndx_out = ndx;
@@ -1471,17 +1492,17 @@ static rf_status_t rf_send_ndx(RsyncFetch_t *rf, int32_t ndx) {
 	}
 
 	if(diff < 0xFE && diff > 0) {
-		return rf_send_uint8(rf, diff);
+		RF_PROPAGATE_STATUS(rf_send_uint8(rf, diff));
 	} else {
 		RF_PROPAGATE_ERROR(rf_send_uint8(rf, UINT8_C(0xFE)));
 		if(diff < 0 || diff > 0x7FFF) {
 			RF_PROPAGATE_ERROR(rf_send_uint8(rf, (ndx >> 24) | UINT8_C(0x80)));
 			RF_PROPAGATE_ERROR(rf_send_uint8(rf, ndx));
 			RF_PROPAGATE_ERROR(rf_send_uint8(rf, ndx >> 8));
-			return rf_send_uint8(rf, ndx >> 16);
+			RF_PROPAGATE_STATUS(rf_send_uint8(rf, ndx >> 16));
 		} else {
 			RF_PROPAGATE_ERROR(rf_send_uint8(rf, diff >> 8));
-			return rf_send_uint8(rf, diff);
+			RF_PROPAGATE_STATUS(rf_send_uint8(rf, diff));
 		}
 	}
 }
@@ -1506,7 +1527,7 @@ static rf_status_t rf_recv_vstring(RsyncFetch_t *rf, rf_refstring_t *strp) {
 	} else {
 		rf_refstring_free(rf, &str);
 	}
-	return s;
+	RF_PROPAGATE_STATUS(s);
 }
 
 static rf_status_t rf_hardlink_add(RsyncFetch_t *rf, int32_t ndx, rf_refstring_t name) {
@@ -1517,7 +1538,7 @@ static rf_status_t rf_hardlink_add(RsyncFetch_t *rf, int32_t ndx, rf_refstring_t
 		avl_node_t *node = malloc(RF_HARDLINKS_BUFSIZE);
 		if(!node) {
 			rf_refstring_free(rf, &name);
-			return RF_STATUS_ERRNO;
+			RF_RETURN_STATUS(RF_STATUS_ERRNO);
 		}
 
 		rf_hardlinks_t *hardlink = node->item = node + 1;
@@ -1536,7 +1557,7 @@ static rf_status_t rf_hardlink_add(RsyncFetch_t *rf, int32_t ndx, rf_refstring_t
 
 		rf->hardlinks_num = num + 1;
 	}
-	return RF_STATUS_OK;
+	RF_RETURN_STATUS(RF_STATUS_OK);
 }
 
 static rf_refstring_t rf_hardlink_find(RsyncFetch_t *rf, int32_t ndx) {
@@ -1675,13 +1696,13 @@ static int rf_flist_entry_cmp(const void *ap, const void *bp) {
 static rf_status_t rf_flist_new(RsyncFetch_t *rf, int32_t offset, rf_flist_t **flistp) {
 	rf_flist_t *flist = malloc(sizeof *flist);
 	if(!flist)
-		return RF_STATUS_ERRNO;
+		RF_RETURN_STATUS(RF_STATUS_ERRNO);
 	*flist = rf_flist_0;
 	flist->offset = offset;
 	flist->node.item = flist;
 	avl_insert_before(&rf->flists, NULL, &flist->node);
 	*flistp = flist;
-	return RF_STATUS_OK;
+	RF_RETURN_STATUS(RF_STATUS_OK);
 }
 
 static void rf_flist_free(RsyncFetch_t *rf, rf_flist_t **flistp) {
@@ -1715,14 +1736,14 @@ static rf_status_t rf_flist_add_entry(RsyncFetch_t *rf, rf_flist_t *flist, rf_fl
 		size -= RF_BUFNUM_ADJUSTMENT;
 		entries = realloc(entries, size * sizeof *entries);
 		if(!entries)
-			return RF_STATUS_ERRNO;
+			RF_RETURN_STATUS(RF_STATUS_ERRNO);
 		flist->entries = entries;
 		flist->size = size;
 	}
 	entries[num] = entry;
 	flist->num = num + 1;
 	
-	return RF_STATUS_OK;
+	RF_RETURN_STATUS(RF_STATUS_OK);
 }
 
 static rf_status_t rf_fill_flist_entry(RsyncFetch_t *rf, rf_flist_t *flist, rf_flist_entry_t *entry, uint16_t xflags) {
@@ -1733,7 +1754,7 @@ static rf_status_t rf_fill_flist_entry(RsyncFetch_t *rf, rf_flist_t *flist, rf_f
 		RF_PROPAGATE_ERROR(rf_recv_uint8(rf, &b));
 		len1 = b;
 		if(len1 > rf_refstring_len(last_name))
-			return RF_STATUS_PROTO;
+			RF_RETURN_STATUS(RF_STATUS_PROTO);
 	} else {
 		len1 = 0;
 	}
@@ -1750,7 +1771,7 @@ static rf_status_t rf_fill_flist_entry(RsyncFetch_t *rf, rf_flist_t *flist, rf_f
 
 	size_t name_len = len1 + len2;
 	if(!name_len)
-		return RF_STATUS_PROTO;
+		RF_RETURN_STATUS(RF_STATUS_PROTO);
 
 	rf_refstring_t name = NULL;
 	RF_PROPAGATE_ERROR(rf_refstring_newlen(rf, NULL, name_len, &name));
@@ -1760,7 +1781,7 @@ static rf_status_t rf_fill_flist_entry(RsyncFetch_t *rf, rf_flist_t *flist, rf_f
 		memcpy(name, last_name, len1);
 	RF_PROPAGATE_ERROR(rf_recv_bytes(rf, name + len1, len2));
 	if(memchr(name, '\0', name_len))
-		return RF_STATUS_PROTO;
+		RF_RETURN_STATUS(RF_STATUS_PROTO);
 
 	rf_refstring_dup(rf, name, &rf->last.name);
 
@@ -1778,14 +1799,14 @@ static rf_status_t rf_fill_flist_entry(RsyncFetch_t *rf, rf_flist_t *flist, rf_f
 			if(!hardlink) {
 				fprintf(stderr, "unable to connect hardlink for %s\n", name);
 				fprintf(stderr, "\tndx=%"PRId32" min_offset=%zu\n", hlink, ((rf_flist_t *)rf->flists.head->item)->offset);
-				return RF_STATUS_PROTO;
+				RF_RETURN_STATUS(RF_STATUS_PROTO);
 			}
 
 			rf_refstring_dup(rf, hardlink, &entry->hardlink);
 		} else {
 			rf_flist_entry_t *hardlink = rf_flist_get_entry(rf, flist, hlink);
 			if(!hardlink || !hardlink->is_hardlink_target)
-				return RF_STATUS_PROTO;
+				RF_RETURN_STATUS(RF_STATUS_PROTO);
 
 			entry->size = hardlink->size;
 			rf->last.mode = entry->mode = hardlink->mode;
@@ -1803,7 +1824,7 @@ static rf_status_t rf_fill_flist_entry(RsyncFetch_t *rf, rf_flist_t *flist, rf_f
 
 			rf_refstring_dup(rf, hardlink->name, &entry->hardlink);
 
-			return RF_STATUS_OK;
+			RF_RETURN_STATUS(RF_STATUS_OK);
 		}
 	}
 
@@ -1878,21 +1899,23 @@ static rf_status_t rf_fill_flist_entry(RsyncFetch_t *rf, rf_flist_t *flist, rf_f
 		int32_t len;
 		RF_PROPAGATE_ERROR(rf_recv_varint(rf, &len));
 		if(len > 65536)
-			return RF_STATUS_PROTO;
+			RF_RETURN_STATUS(RF_STATUS_PROTO);
 		rf_refstring_t symlink = NULL;
 		RF_PROPAGATE_ERROR(rf_refstring_newlen(rf, NULL, len, &symlink));
 		entry->symlink = symlink;
 		RF_PROPAGATE_ERROR(rf_recv_bytes(rf, symlink, len));
 	}
 
-	return RF_STATUS_OK;
+	RF_RETURN_STATUS(RF_STATUS_OK);
 }
 
 static rf_status_t rf_recv_flist_entry(RsyncFetch_t *rf, rf_flist_t *flist, rf_flist_entry_t **entryp) {
 	uint8_t b;
 	RF_PROPAGATE_ERROR(rf_recv_uint8(rf, &b));
-	if(!b)
-		return *entryp = NULL, RF_STATUS_OK;
+	if(!b) {
+		*entryp = NULL;
+		RF_RETURN_STATUS(RF_STATUS_OK);
+	}
 
 	uint16_t xflags = b;
 	if(xflags & XMIT_EXTENDED_FLAGS) {
@@ -1903,22 +1926,24 @@ static rf_status_t rf_recv_flist_entry(RsyncFetch_t *rf, rf_flist_t *flist, rf_f
 			int32_t err;
 			RF_PROPAGATE_ERROR(rf_recv_varint(rf, &err));
 			// we ignore all numerical errors anyway
-			return *entryp = NULL, RF_STATUS_OK;
+			*entryp = NULL;
+			RF_RETURN_STATUS(RF_STATUS_OK);
 		}
 	}
 
 	rf_flist_entry_t *entry = malloc(sizeof *entry);
 	if(!entry)
-		return RF_STATUS_ERRNO;
+		RF_RETURN_STATUS(RF_STATUS_ERRNO);
 	*entry = rf_flist_entry_0;
 
 	rf_status_t s = rf_fill_flist_entry(rf, flist, entry, xflags);
 	if(s != RF_STATUS_OK) {
 		rf_flist_entry_free(rf, entry);
-		return s;
+		RF_PROPAGATE_STATUS(s);
 	}
 
-	return *entryp = entry, RF_STATUS_OK;
+	*entryp = entry;
+	RF_RETURN_STATUS(RF_STATUS_OK);
 }
 
 static rf_status_t rf_recv_flist(RsyncFetch_t *rf) {
@@ -1973,7 +1998,7 @@ static rf_status_t rf_recv_flist(RsyncFetch_t *rf) {
 				entry->hardlink, rf_refstring_len(entry->hardlink)
 			);
 			if(!data_callback)
-				return RF_STATUS_PYTHON;
+				RF_RETURN_STATUS(RF_STATUS_PYTHON);
 			if(data_callback == Py_None) {
 				Py_DecRef(data_callback);
 			} else {
@@ -1990,7 +2015,7 @@ static rf_status_t rf_recv_flist(RsyncFetch_t *rf) {
 					entry->data_callback = NULL;
 					Py_DecRef(data_callback);
 					if(!result)
-						return RF_STATUS_PYTHON;
+						RF_RETURN_STATUS(RF_STATUS_PYTHON);
 					Py_DecRef(result);
 				}
 			}
@@ -2002,13 +2027,13 @@ static rf_status_t rf_recv_flist(RsyncFetch_t *rf) {
 
 	RF_PROPAGATE_ERROR(rf_send_ndx(rf, NDX_DONE));
 
-	return RF_STATUS_OK;
+	RF_RETURN_STATUS(RF_STATUS_OK);
 }
 
 static rf_status_t rf_recv_filedata(RsyncFetch_t *rf, rf_flist_entry_t *entry) {
 	PyObject *data_callback = entry->data_callback;
 	if(!data_callback)
-		return RF_STATUS_PROTO;
+		RF_RETURN_STATUS(RF_STATUS_PROTO);
 
 	PyObject *bytes = rf->chunk_bytes;
 	size_t size = rf->chunk_size;
@@ -2016,7 +2041,7 @@ static rf_status_t rf_recv_filedata(RsyncFetch_t *rf, rf_flist_entry_t *entry) {
 	uint32_t remaining = 0;
 	char *buf = rf->chunk_buffer;
 	if(!bytes || !buf)
-		return RF_STATUS_ASSERT;
+		RF_RETURN_STATUS(RF_STATUS_ASSERT);
 
 	for(;;) {
 		if(!remaining) {
@@ -2040,13 +2065,13 @@ static rf_status_t rf_recv_filedata(RsyncFetch_t *rf, rf_flist_entry_t *entry) {
 			PyObject *result = PyObject_CallFunctionObjArgs(data_callback, bytes, NULL);
 			Py_CLEAR(rf->chunk_bytes);
 			if(!result)
-				return RF_STATUS_PYTHON;
+				RF_RETURN_STATUS(RF_STATUS_PYTHON);
 			Py_DecRef(result);
 
 			// allocate a new buffer for the next chunk (while we still hold the GIL)
 			bytes = PyBytes_FromStringAndSize(NULL, size);
 			if(!bytes)
-				return RF_STATUS_PYTHON;
+				RF_RETURN_STATUS(RF_STATUS_PYTHON);
 			rf->chunk_bytes = bytes;
 			rf->chunk_buffer = buf = PyBytes_AS_STRING(bytes);
 		}
@@ -2058,20 +2083,20 @@ static rf_status_t rf_recv_filedata(RsyncFetch_t *rf, rf_flist_entry_t *entry) {
 		if(_PyBytes_Resize(&bytes, fill) == -1) {
 			// if this fails the old copy is gone too
 			rf->chunk_bytes = NULL;
-			return RF_STATUS_PYTHON;
+			RF_RETURN_STATUS(RF_STATUS_PYTHON);
 		}
 
 		PyObject *result = PyObject_CallFunctionObjArgs(data_callback, bytes, NULL);
 		Py_DecRef(bytes);
 		rf->chunk_bytes = NULL;
 		if(!result)
-			return RF_STATUS_PYTHON;
+			RF_RETURN_STATUS(RF_STATUS_PYTHON);
 		Py_DecRef(result);
 
 		// allocate a new buffer for the next chunk (while we still hold the GIL)
 		bytes = PyBytes_FromStringAndSize(NULL, size);
 		if(!bytes)
-			return RF_STATUS_PYTHON;
+			RF_RETURN_STATUS(RF_STATUS_PYTHON);
 		rf->chunk_bytes = bytes;
 		rf->chunk_buffer = PyBytes_AS_STRING(bytes);
 	}
@@ -2080,17 +2105,17 @@ static rf_status_t rf_recv_filedata(RsyncFetch_t *rf, rf_flist_entry_t *entry) {
 	entry->data_callback = NULL;
 	Py_DecRef(data_callback);
 	if(!result)
-		return RF_STATUS_PYTHON;
+		RF_RETURN_STATUS(RF_STATUS_PYTHON);
 	Py_DecRef(result);
 
-	return RF_STATUS_OK;
+	RF_RETURN_STATUS(RF_STATUS_OK);
 }
 
 static rf_status_t rf_mainloop(RsyncFetch_t *rf) {
 	uint32_t remote_protocol;
 	RF_PROPAGATE_ERROR(rf_recv_uint32(rf, &remote_protocol));
 	if(remote_protocol < 30)
-		return RF_STATUS_PROTO;
+		RF_RETURN_STATUS(RF_STATUS_PROTO);
 	RF_PROPAGATE_ERROR(rf_send_uint32(rf, 31));
 	rf->protocol = remote_protocol;
 
@@ -2159,7 +2184,7 @@ static rf_status_t rf_mainloop(RsyncFetch_t *rf) {
 			RF_PROPAGATE_ERROR(rf_recv_uint32(rf, &remainder_length));
 
 			if(number_of_checksums)
-				return RF_STATUS_PROTO;
+				RF_RETURN_STATUS(RF_STATUS_PROTO);
 
 			RF_PROPAGATE_ERROR(rf_recv_filedata(rf, rf_find_ndx(rf, ndx)));
 
@@ -2192,11 +2217,11 @@ static rf_status_t rf_mainloop(RsyncFetch_t *rf) {
 		int32_t ndx;
 		RF_PROPAGATE_ERROR(rf_recv_ndx(rf, &ndx));
 		if(ndx != NDX_DONE)
-			return RF_STATUS_PROTO;
+			RF_RETURN_STATUS(RF_STATUS_PROTO);
 		RF_PROPAGATE_ERROR(rf_send_ndx(rf, NDX_DONE));
 	}
 
-	return rf_wait_for_eof(rf);
+	RF_PROPAGATE_STATUS(rf_wait_for_eof(rf));
 }
 
 static rf_status_t rf_run(RsyncFetch_t *rf) {
@@ -2254,7 +2279,7 @@ static rf_status_t rf_run(RsyncFetch_t *rf) {
 							out_pipe[0] = -1;
 							if(close(err_pipe[1]) != -1) {
 								err_pipe[1] = -1;
-								return rf_mainloop(rf);
+								RF_PROPAGATE_STATUS(rf_mainloop(rf));
 							}
 						}
 					}
@@ -2269,7 +2294,7 @@ static rf_status_t rf_run(RsyncFetch_t *rf) {
 			close(in_pipe[1]);
 	}
 
-	return RF_STATUS_ERRNO;
+	RF_RETURN_STATUS(RF_STATUS_ERRNO);
 }
 
 static bool rf_status_to_exception(RsyncFetch_t *rf, rf_status_t s) {
@@ -2512,7 +2537,7 @@ static int RsyncFetch_init_locked(RsyncFetch_t *rf, PyObject *args, PyObject *kw
 
 	rf->timeout = timeout;
 
-	return RF_STATUS_OK;
+	RF_RETURN_STATUS(RF_STATUS_OK);
 }
 
 static int RsyncFetch_init(PyObject *self, PyObject *args, PyObject *kwargs) {
