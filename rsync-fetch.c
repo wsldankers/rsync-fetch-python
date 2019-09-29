@@ -250,6 +250,7 @@ typedef enum {
 	RF_STATUS_HANGUP,
 	RF_STATUS_ASSERT,
 	RF_STATUS_PROTO,
+	RF_STATUS_EXIT,
 } rf_status_t;
 
 typedef struct rf_flist_entry {
@@ -1106,7 +1107,7 @@ static rf_status_t rf_recv_bytes(RsyncFetch_t *rf, char *buf, size_t len) {
 						RF_PROPAGATE_ERROR(rf_recv_bytes_raw(rf, (char *)&err, sizeof err));
 					else if(multiplex_in_remaining)
 						return RF_STATUS_PROTO;
-					break;
+					return RF_STATUS_EXIT;
 				case MSG_NO_SEND:
 					if(multiplex_in_remaining != sizeof err)
 						return RF_STATUS_PROTO;
@@ -2279,6 +2280,9 @@ static bool rf_status_to_exception(RsyncFetch_t *rf, rf_status_t s) {
 			break;
 		case RF_STATUS_PROTO:
 			PyErr_Format(PyExc_RuntimeError, "protocol error");
+			break;
+		case RF_STATUS_EXIT:
+			PyErr_Format(PyExc_RuntimeError, "rsync process exited due to a fatal error");
 			break;
 		default:
 		case RF_STATUS_ASSERT:
