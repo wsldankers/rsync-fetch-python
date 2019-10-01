@@ -1006,11 +1006,11 @@ static rf_status_t rf_read_error_stream(RsyncFetch_t *rf) {
 
 __attribute__((hot))
 static rf_status_t rf_recv_bytes_raw(RsyncFetch_t *rf, char *dst, size_t len) {
-	rf_pipestream_t *stream = &rf->in_stream;
-	size_t fill = stream->fill;
-	size_t size = stream->size;
-	size_t offset = stream->offset;
-	char *buf = stream->buf;
+	rf_pipestream_t *in_stream = &rf->in_stream;
+	size_t fill = in_stream->fill;
+	size_t size = in_stream->size;
+	size_t offset = in_stream->offset;
+	char *buf = in_stream->buf;
 
 	rf_unblock_threads(rf);
 
@@ -1019,28 +1019,28 @@ static rf_status_t rf_recv_bytes_raw(RsyncFetch_t *rf, char *dst, size_t len) {
 		buf = malloc(size);
 		if(!buf)
 			RF_RETURN_STATUS(RF_STATUS_ERRNO);
-		stream->buf = buf;
-		stream->size = size;
+		in_stream->buf = buf;
+		in_stream->size = size;
 	}
 
 	if(len > fill) {
 		if(fill) {
 			if(offset + fill > size) {
 				size_t amount = size - offset;
-				memcpy(dst, stream->buf + offset, amount);
+				memcpy(dst, in_stream->buf + offset, amount);
 				memcpy(dst + amount, buf, fill - amount);
 			} else {
 				memcpy(dst, buf + offset, fill);
 			}
 			dst += fill;
 			len -= fill;
-			stream->offset = 0;
-			stream->fill = 0;
+			in_stream->offset = 0;
+			in_stream->fill = 0;
 		}
 
 		rf_pipestream_t *out_stream = &rf->out_stream;
 		rf_pipestream_t *err_stream = &rf->err_stream;
-		int fd = stream->fd;
+		int in_fd = in_stream->fd;
 		int out_fd = out_stream->fd;
 		int err_fd = err_stream->fd;
 		int timeout = rf->timeout / UINT64_C(1000000);
@@ -1050,8 +1050,9 @@ static rf_status_t rf_recv_bytes_raw(RsyncFetch_t *rf, char *dst, size_t len) {
 				static const uint8_t mplex[4] = { 0, 0, 0, MSG_DATA + MPLEX_BASE };
 				RF_PROPAGATE_ERROR(rf_send_bytes_raw(rf, (const char *)mplex, sizeof mplex));
 			}
+
 			struct pollfd pfds[3] = {
-				{ .fd = fd, .events = POLLIN },
+				{ .fd = in_fd, .events = POLLIN },
 				{ .fd = out_stream->fill ? out_fd : -1, .events = POLLOUT },
 				{ .fd = err_fd, .events = POLLIN },
 			};
@@ -1062,42 +1063,46 @@ static rf_status_t rf_recv_bytes_raw(RsyncFetch_t *rf, char *dst, size_t len) {
 			if(r == 0)
 				RF_RETURN_STATUS(RF_STATUS_TIMEOUT);
 
-			if(pfds[RF_STREAM_IN].revents & (POLLERR|POLLHUP))
+			// POSIX 1003.1-2008 on POLLHUP: This event and POLLOUT are
+			// mutually-exclusive; a stream can never be writable if a hangup has
+			// occurred. However, this event and POLLIN, POLLRDNORM, POLLRDBAND, or
+			// POLLPRI are not mutually-exclusive.
+
+			if(pfds[RF_STREAM_OUT].revents & POLLHUP)
 				RF_RETURN_STATUS(RF_STATUS_HANGUP);
 
-			if(pfds[RF_STREAM_OUT].revents & (POLLERR|POLLHUP))
-				RF_RETURN_STATUS(RF_STATUS_HANGUP);
-
-			if(pfds[RF_STREAM_ERR].revents & (POLLERR|POLLHUP)) {
+			if(pfds[RF_STREAM_ERR].revents & POLLERR) {
+				close(err_fd);
+				err_stream->fd = err_fd = -1;
+			} else if(pfds[RF_STREAM_ERR].revents & POLLIN) {
+				RF_PROPAGATE_ERROR(rf_read_error_stream(rf));
+			} else if(pfds[RF_STREAM_ERR].revents & POLLHUP) {
 				close(err_fd);
 				err_stream->fd = err_fd = -1;
 			}
 
-			if(pfds[RF_STREAM_ERR].revents & POLLIN) {
-				RF_PROPAGATE_ERROR(rf_read_error_stream(rf));
-				continue;
-			}
-
-			if(pfds[RF_STREAM_OUT].revents & POLLOUT) {
+			if(pfds[RF_STREAM_OUT].revents & (POLLOUT|POLLERR)) {
 				RF_PROPAGATE_ERROR(rf_write_out_stream(rf));
 				continue;
 			}
 
-			if(pfds[RF_STREAM_IN].revents & POLLIN) {
+			if(pfds[RF_STREAM_IN].revents & (POLLIN|POLLERR)) {
 				struct iovec iov[2] = {
 					{ dst, len },
 					{ buf, size },
 				};
-				ssize_t r = readv(fd, iov, orz(iov));
+				ssize_t r = readv(in_fd, iov, orz(iov));
 				if(r == -1)
 					RF_RETURN_STATUS(RF_STATUS_ERRNO);
 				if(r < len) {
 					dst += r;
 					len -= r;
 				} else {
-					stream->fill = r - len;
+					in_stream->fill = r - len;
 					RF_RETURN_STATUS(RF_STATUS_OK);
 				}
+			} else if(pfds[RF_STREAM_IN].revents & POLLHUP) {
+				RF_RETURN_STATUS(RF_STATUS_HANGUP);
 			}
 		}
 	} else {
@@ -1106,18 +1111,18 @@ static rf_status_t rf_recv_bytes_raw(RsyncFetch_t *rf, char *dst, size_t len) {
 		} else if(offset + len > size) {
 			size_t amount = size - offset;
 			memcpy(dst, buf + offset, amount);
-			memcpy(dst + amount, stream->buf, len - amount);
+			memcpy(dst + amount, in_stream->buf, len - amount);
 		} else {
 			memcpy(dst, buf + offset, len);
 		}
 
 		if(len == fill) {
-			stream->offset = 0;
-			stream->fill = 0;
+			in_stream->offset = 0;
+			in_stream->fill = 0;
 		} else {
 			offset += len;
-			stream->offset = offset < size ? offset : offset - size;
-			stream->fill = fill - len;
+			in_stream->offset = offset < size ? offset : offset - size;
+			in_stream->fill = fill - len;
 		}
 	}
 
@@ -1125,10 +1130,10 @@ static rf_status_t rf_recv_bytes_raw(RsyncFetch_t *rf, char *dst, size_t len) {
 }
 
 static rf_status_t rf_wait_for_eof(RsyncFetch_t *rf) {
-	rf_pipestream_t *stream = &rf->in_stream;
+	rf_pipestream_t *in_stream = &rf->in_stream;
 	rf_pipestream_t *out_stream = &rf->out_stream;
 	rf_pipestream_t *err_stream = &rf->err_stream;
-	int fd = stream->fd;
+	int in_fd = in_stream->fd;
 	int out_fd = out_stream->fd;
 	int err_fd = err_stream->fd;
 	int timeout = rf->timeout / UINT64_C(1000000);
@@ -1136,11 +1141,11 @@ static rf_status_t rf_wait_for_eof(RsyncFetch_t *rf) {
 	rf_unblock_threads(rf);
 
 	for(;;) {
-		if(stream->fill)
+		if(in_stream->fill)
 			RF_RETURN_STATUS(RF_STATUS_PROTO);
 
 		struct pollfd pfds[3] = {
-			{ .fd = fd, .events = POLLIN },
+			{ .fd = in_fd, .events = POLLIN },
 			{ .fd = out_stream->fill ? out_fd : -1, .events = POLLOUT },
 			{ .fd = err_fd, .events = POLLIN },
 		};
@@ -1151,28 +1156,39 @@ static rf_status_t rf_wait_for_eof(RsyncFetch_t *rf) {
 		if(r == 0)
 			RF_RETURN_STATUS(RF_STATUS_TIMEOUT);
 
-		if(pfds[RF_STREAM_ERR].revents & POLLIN)
+		if(pfds[RF_STREAM_ERR].revents & POLLERR) {
+			close(err_fd);
+			err_stream->fd = -1;
+		} else if(pfds[RF_STREAM_ERR].revents & POLLIN) {
 			RF_PROPAGATE_ERROR(rf_read_error_stream(rf));
-
-		if(pfds[RF_STREAM_OUT].revents & POLLOUT)
-			RF_PROPAGATE_ERROR(rf_write_out_stream(rf));
-
-		if(pfds[RF_STREAM_IN].revents & POLLIN)
-			RF_RETURN_STATUS(RF_STATUS_PROTO);
-
-		if(pfds[RF_STREAM_ERR].revents & (POLLERR|POLLHUP)) {
+		} else if(pfds[RF_STREAM_ERR].revents & POLLHUP) {
 			close(err_fd);
 			err_stream->fd = -1;
 		}
 
-		if(pfds[RF_STREAM_OUT].revents & (POLLERR|POLLHUP)) {
+		if(pfds[RF_STREAM_OUT].revents & POLLERR) {
 			close(out_fd);
 			out_stream->fd = -1;
+			if(out_stream->fill)
+				RF_RETURN_STATUS(RF_STATUS_HANGUP);
+		} else if(pfds[RF_STREAM_OUT].revents & POLLOUT) {
+			RF_PROPAGATE_ERROR(rf_write_out_stream(rf));
+		} else if(pfds[RF_STREAM_OUT].revents & POLLHUP) {
+			close(out_fd);
+			out_stream->fd = -1;
+			if(out_stream->fill)
+				RF_RETURN_STATUS(RF_STATUS_HANGUP);
 		}
 
-		if(pfds[RF_STREAM_IN].revents & (POLLERR|POLLHUP)) {
-			close(fd);
-			stream->fd = -1;
+		if(pfds[RF_STREAM_IN].revents & POLLERR) {
+			close(in_fd);
+			in_stream->fd = -1;
+			RF_RETURN_STATUS(RF_STATUS_OK);
+		} else if(pfds[RF_STREAM_IN].revents & POLLIN) {
+			RF_RETURN_STATUS(RF_STATUS_PROTO);
+		} else if(pfds[RF_STREAM_IN].revents & (POLLERR|POLLHUP)) {
+			close(in_fd);
+			in_stream->fd = -1;
 			RF_RETURN_STATUS(RF_STATUS_OK);
 		}
 	}
@@ -1196,12 +1212,12 @@ static void rf_drain_error_stream(RsyncFetch_t *rf, nanosecond_t deadline) {
 			if(r == 0 || r == -1)
 				break;
 
-			if(pfd.revents & POLLIN)
+			if(pfd.revents & POLLIN) {
 				if(rf_read_error_stream(rf) != RF_STATUS_OK)
 					return;
-
-			if(pfd.revents & (POLLERR|POLLHUP))
+			} else if(pfd.revents & (POLLERR|POLLHUP)) {
 				break;
+			}
 		}
 	}
 
