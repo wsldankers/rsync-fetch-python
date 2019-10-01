@@ -1068,22 +1068,20 @@ static rf_status_t rf_recv_bytes_raw(RsyncFetch_t *rf, char *dst, size_t len) {
 			// occurred. However, this event and POLLIN, POLLRDNORM, POLLRDBAND, or
 			// POLLPRI are not mutually-exclusive.
 
-			if(pfds[RF_STREAM_OUT].revents & POLLHUP)
+			if(pfds[RF_STREAM_OUT].revents & POLLHUP) {
 				RF_RETURN_STATUS(RF_STATUS_HANGUP);
+			} else if(pfds[RF_STREAM_OUT].revents & (POLLOUT|POLLERR)) {
+				RF_PROPAGATE_ERROR(rf_write_out_stream(rf));
+				continue; // prioritize writing output
+			}
 
-			if(pfds[RF_STREAM_ERR].revents & POLLERR) {
+			if(pfds[RF_STREAM_ERR].revents & POLLERR
+			|| (pfds[RF_STREAM_ERR].revents & (POLLIN|POLLHUP)) == POLLHUP) {
 				close(err_fd);
 				err_stream->fd = err_fd = -1;
 			} else if(pfds[RF_STREAM_ERR].revents & POLLIN) {
 				RF_PROPAGATE_ERROR(rf_read_error_stream(rf));
-			} else if(pfds[RF_STREAM_ERR].revents & POLLHUP) {
-				close(err_fd);
-				err_stream->fd = err_fd = -1;
-			}
-
-			if(pfds[RF_STREAM_OUT].revents & (POLLOUT|POLLERR)) {
-				RF_PROPAGATE_ERROR(rf_write_out_stream(rf));
-				continue;
+				continue; // prioritize reading stderr
 			}
 
 			if(pfds[RF_STREAM_IN].revents & (POLLIN|POLLERR)) {
@@ -1156,40 +1154,33 @@ static rf_status_t rf_wait_for_eof(RsyncFetch_t *rf) {
 		if(r == 0)
 			RF_RETURN_STATUS(RF_STATUS_TIMEOUT);
 
-		if(pfds[RF_STREAM_ERR].revents & POLLERR) {
+		if(pfds[RF_STREAM_ERR].revents & POLLERR
+		|| (pfds[RF_STREAM_ERR].revents & (POLLIN|POLLHUP)) == POLLHUP) {
 			close(err_fd);
 			err_stream->fd = -1;
 		} else if(pfds[RF_STREAM_ERR].revents & POLLIN) {
 			RF_PROPAGATE_ERROR(rf_read_error_stream(rf));
-		} else if(pfds[RF_STREAM_ERR].revents & POLLHUP) {
-			close(err_fd);
-			err_stream->fd = -1;
+			continue; // prioritize reading stderr
 		}
 
-		if(pfds[RF_STREAM_OUT].revents & POLLERR) {
+		if(pfds[RF_STREAM_OUT].revents & POLLERR
+		|| (pfds[RF_STREAM_OUT].revents & (POLLHUP|POLLOUT)) == POLLHUP) {
 			close(out_fd);
 			out_stream->fd = -1;
 			if(out_stream->fill)
 				RF_RETURN_STATUS(RF_STATUS_HANGUP);
 		} else if(pfds[RF_STREAM_OUT].revents & POLLOUT) {
 			RF_PROPAGATE_ERROR(rf_write_out_stream(rf));
-		} else if(pfds[RF_STREAM_OUT].revents & POLLHUP) {
-			close(out_fd);
-			out_stream->fd = -1;
-			if(out_stream->fill)
-				RF_RETURN_STATUS(RF_STATUS_HANGUP);
+			continue; // prioritize writing output
 		}
 
-		if(pfds[RF_STREAM_IN].revents & POLLERR) {
+		if(pfds[RF_STREAM_IN].revents & POLLERR
+		|| (pfds[RF_STREAM_IN].revents & (POLLIN|POLLHUP)) == POLLHUP) {
 			close(in_fd);
 			in_stream->fd = -1;
 			RF_RETURN_STATUS(RF_STATUS_OK);
 		} else if(pfds[RF_STREAM_IN].revents & POLLIN) {
 			RF_RETURN_STATUS(RF_STATUS_PROTO);
-		} else if(pfds[RF_STREAM_IN].revents & (POLLERR|POLLHUP)) {
-			close(in_fd);
-			in_stream->fd = -1;
-			RF_RETURN_STATUS(RF_STATUS_OK);
 		}
 	}
 }
@@ -1212,12 +1203,10 @@ static void rf_drain_error_stream(RsyncFetch_t *rf, nanosecond_t deadline) {
 			if(r == 0 || r == -1)
 				break;
 
-			if(pfd.revents & POLLIN) {
-				if(rf_read_error_stream(rf) != RF_STATUS_OK)
-					return;
-			} else if(pfd.revents & (POLLERR|POLLHUP)) {
+			if(pfd.revents & POLLERR || (pfd.revents & (POLLIN|POLLHUP)) == POLLHUP)
 				break;
-			}
+			else if(pfd.revents & POLLIN && rf_read_error_stream(rf) != RF_STATUS_OK)
+				return;
 		}
 	}
 
@@ -2234,9 +2223,38 @@ static rf_status_t rf_mainloop(RsyncFetch_t *rf) {
 		RF_PROPAGATE_ERROR(rf_recv_ndx(rf, &ndx));
 		if(ndx != NDX_DONE)
 			RF_RETURN_STATUS(RF_STATUS_PROTO);
+
 		// read_final_goodbye() in rsync/main.c appears to try to read this
-		// but rsync certainly does not seem to wait for it.
+		// but rsync certainly does not seem to wait for it:
 		// RF_PROPAGATE_ERROR(rf_send_ndx(rf, NDX_DONE));
+
+		/*
+			The reason the above rf_send_ndx() is commented out is a bit
+			mysterious. There appears to be a discrepancy between various
+			sides of the protocol.
+
+			What the official server does:
+
+				read_ndx
+				write_ndx
+				read_ndx
+
+			What the official client does:
+			   
+				write_ndx
+
+			The only combination that seems to work for us as a client
+			if we do not want to prematurely disconnect or discard anything:
+
+				write_ndx
+				read_ndx
+
+			These read/write operations all seem irreconcilable. The latter
+			combination of reads and writes was determined empirically to be
+			the only one that works reliably.
+
+			So that's what's implemented here. vOv
+		*/
 	}
 
 	RF_PROPAGATE_STATUS(rf_wait_for_eof(rf));
