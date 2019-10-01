@@ -2234,7 +2234,9 @@ static rf_status_t rf_mainloop(RsyncFetch_t *rf) {
 		RF_PROPAGATE_ERROR(rf_recv_ndx(rf, &ndx));
 		if(ndx != NDX_DONE)
 			RF_RETURN_STATUS(RF_STATUS_PROTO);
-		RF_PROPAGATE_ERROR(rf_send_ndx(rf, NDX_DONE));
+		// read_final_goodbye() in rsync/main.c appears to try to read this
+		// but rsync certainly does not seem to wait for it.
+		// RF_PROPAGATE_ERROR(rf_send_ndx(rf, NDX_DONE));
 	}
 
 	RF_PROPAGATE_STATUS(rf_wait_for_eof(rf));
