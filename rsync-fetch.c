@@ -298,7 +298,7 @@ typedef struct rf_hardlinks {
 
 #else
 
-static const char *rf_status_names[] = {
+static const char * const rf_status_names[] = {
 	"RF_STATUS_OK",
 	"RF_STATUS_ERRNO",
 	"RF_STATUS_PYTHON",
@@ -309,9 +309,9 @@ static const char *rf_status_names[] = {
 	"RF_STATUS_EXIT",
 };
 
-#define RF_PROPAGATE_STATUS(x) do { rf_status_t __rf_propagate_error = (x); if(__rf_propagate_error != RF_STATUS_OK) fprintf(stderr, "%s:%d: %s propagated by %s()\n", __FILE__, __LINE__, rf_status_names[__rf_propagate_error], __func__); return __rf_propagate_error; } while(false)
+#define RF_PROPAGATE_STATUS(x) do { rf_status_t __rf_propagate_status = (x); if(__rf_propagate_status != RF_STATUS_OK) fprintf(stderr, "%s:%d: %s propagated by %s()\n", __FILE__, __LINE__, rf_status_names[__rf_propagate_status], __func__); return __rf_propagate_status; } while(false)
 #define RF_PROPAGATE_ERROR(x) do { rf_status_t __rf_propagate_error = (x); if(__rf_propagate_error != RF_STATUS_OK) { fprintf(stderr, "%s:%d: %s propagated by %s()\n", __FILE__, __LINE__, rf_status_names[__rf_propagate_error], __func__); return __rf_propagate_error; } } while(false)
-#define RF_RETURN_STATUS(x) do { rf_status_t __rf_return_error = (x); if(__rf_return_error != RF_STATUS_OK) fprintf(stderr, "%s:%d: %s returned by %s()\n", __FILE__, __LINE__, rf_status_names[__rf_return_error], __func__); return __rf_return_error; } while(false)
+#define RF_RETURN_STATUS(x) do { rf_status_t __rf_return_status = (x); if(__rf_return_status != RF_STATUS_OK) fprintf(stderr, "%s:%d: %s returned by %s()\n", __FILE__, __LINE__, rf_status_names[__rf_return_status], __func__); return __rf_return_status; } while(false)
 
 #endif
 
