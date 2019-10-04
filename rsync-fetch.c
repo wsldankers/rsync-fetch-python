@@ -2203,6 +2203,8 @@ static rf_status_t rf_mainloop(RsyncFetch_t *rf) {
 		}
 	}
 
+	RF_PROPAGATE_ERROR(rf_send_ndx(rf, NDX_DONE));
+
 	// stats follow
 
 	int64_t total_read;
@@ -2215,8 +2217,6 @@ static rf_status_t rf_mainloop(RsyncFetch_t *rf) {
 	RF_PROPAGATE_ERROR(rf_recv_varlong(rf, 3, &flist_buildtime));
 	int64_t flist_xfertime;
 	RF_PROPAGATE_ERROR(rf_recv_varlong(rf, 3, &flist_xfertime));
-
-	RF_PROPAGATE_ERROR(rf_send_ndx(rf, NDX_DONE));
 
 	if(rf->protocol >= 31) {
 		int32_t ndx;
