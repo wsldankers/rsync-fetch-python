@@ -171,7 +171,7 @@ typedef char *rf_refstring_t;
 #define RF_BUFNUM_ADJUSTMENT (3)
 #define RF_BUFSIZE_ADJUSTMENT (RF_BUFNUM_ADJUSTMENT * sizeof(void *))
 
-#define RF_KEEPALIVE_INTERVAL (NANOSECONDS_C(10) * NANOSECONDS)
+#define RF_KEEPALIVE_INTERVAL (NANOSECOND_C(10) * NANOSECONDS)
 
 #define MAX_BLOCK_SIZE 131072
 #define MPLEX_BASE 7
@@ -2669,11 +2669,33 @@ static PyMethodDef RsyncFetch_methods[] = {
 	{NULL}
 };
 
+PyDoc_STRVAR(rsync_fetch_object_doc, "RsyncFetch(*, command, environ = None, entry_callback, error_callback = None, filters = None, chunk_size = 32768)\
+\
+	:param command: The command that will be executed to establish the connection to the remote\
+		rsync process. Can be as simple as just calling rsync itself. Should usually include\
+		`RsyncFetch.required_options`. This command is not passed to `/bin/sh` but if you need\
+		sh functionality there's nothing keeping you from calling it yourself.\
+	:type command: iter(str or bytes)\
+	:param environ: The environment to pass to the command. Defaults to the environment of the current\
+		process.\
+	:type environ: iter(str or bytes)\
+	:param callable entry_callback: A callable that will be called for every directory entry found\
+		by the remote rsync. See the module documentation for its parameters and return value.\
+	:param callable error_callback: A callable that will be called for non-fatal errors reported by the\
+		remote rsync process.\
+	:param filters: Filters. These are passed to rsync as-is. Be aware that current versions of rsync\
+		silently ignore malformed filters.\
+	:type filters: iter(str or bytes)\
+	:param int chunk_size: The size of the bytes objects that are given as the argument to the data\
+		callback.\
+");
+
 static PyTypeObject RsyncFetch_type = {
 	PyVarObject_HEAD_INIT(NULL, 0)
 	.tp_flags = Py_TPFLAGS_DEFAULT,
 	.tp_basicsize = sizeof(struct RsyncFetchObject),
 	.tp_name = "rsync_fetch.RsyncFetch",
+	.tp_doc = rsync_fetch_object_doc,
 	.tp_new = RsyncFetch_new,
 	.tp_init = RsyncFetch_init,
 	.tp_dealloc = (destructor)RsyncFetch_dealloc,
