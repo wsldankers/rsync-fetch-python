@@ -290,7 +290,7 @@ typedef struct rf_hardlinks {
 #define RF_HARDLINKS_BUFSIZE (65536 - RF_BUFSIZE_ADJUSTMENT)
 #define RF_HARDLINKS_SIZE ((RF_HARDLINKS_BUFSIZE - sizeof(avl_node_t)) / sizeof(rf_hardlinks_t))
 
-#if 0
+#if 1
 
 #define RF_PROPAGATE_STATUS(x) return (x)
 #define RF_PROPAGATE_ERROR(x) do { rf_status_t __rf_propagate_error = (x); if(__rf_propagate_error != RF_STATUS_OK) return __rf_propagate_error; } while(false)
