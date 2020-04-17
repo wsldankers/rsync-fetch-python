@@ -1,5 +1,9 @@
 #define _LARGEFILE64_SOURCE 1
 #define _GNU_SOURCE 1
+#define PY_SSIZE_T_CLEAN
+
+#include "Python.h"
+#include "pythread.h"
 
 #include <errno.h>
 #include <assert.h>
@@ -18,11 +22,6 @@
 #include <sys/uio.h>
 #include <avl.h>
 
-#define PY_SSIZE_T_CLEAN
-
-#include "Python.h"
-#include "pythread.h"
-
 #define orz(x) (sizeof (x) / sizeof *(x))
 
 static inline void ignore_result(ssize_t r) {
@@ -36,6 +35,7 @@ typedef uint64_t nanosecond_t;
 #define PRIuNANOSECOND PRIu64
 #define PRIxNANOSECOND PRIx64
 #define PRIXNANOSECOND PRIX64
+#define NANOSECONDS_ARE_SIGNED false
 
 static inline nanosecond_t timespec2nanoseconds(struct timespec *ts) {
 	return (nanosecond_t)ts->tv_sec * NANOSECONDS
@@ -43,12 +43,16 @@ static inline nanosecond_t timespec2nanoseconds(struct timespec *ts) {
 }
 
 static inline nanosecond_t nanosecond_truncate(nanosecond_t time) {
+#if NANOSECONDS_ARE_SIGNED
 	return time - (time % NANOSECONDS + NANOSECONDS) % NANOSECONDS;
+#else
+	return time - time % NANOSECONDS;
+#endif
 }
 
 __attribute__((unused))
 static inline struct timespec nanoseconds2timespec(nanosecond_t ns) {
-#if 0
+#if NANOSECONDS_ARE_SIGNED
 	// signed nanosecond case
 	nanosecond_t tv_nsec = (ns % NANOSECONDS + NANOSECONDS) % NANOSECONDS;
 	struct timespec ts = {
