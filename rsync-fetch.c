@@ -413,10 +413,12 @@ static inline RsyncFetch_t *RsyncFetch_Check(PyObject *v, bool check_failed) {
 #ifdef WITH_THREAD
 
 static inline bool rf_unblock_threads(RsyncFetch_t *rf) {
-	if(rf->py_thread_state)
+	if(rf->py_thread_state) {
 		return false;
-	rf->py_thread_state = PyEval_SaveThread();
-	return true;
+	} else {
+		rf->py_thread_state = PyEval_SaveThread();
+		return true;
+	}
 }
 
 static inline bool rf_block_threads(RsyncFetch_t *rf) {
@@ -425,8 +427,9 @@ static inline bool rf_block_threads(RsyncFetch_t *rf) {
 		rf->py_thread_state = NULL;
 		PyEval_RestoreThread(py_thread_state);
 		return true;
+	} else {
+		return false;
 	}
-	return false;
 }
 
 static bool rf_acquire_lock(RsyncFetch_t *rf) {
@@ -1012,9 +1015,9 @@ static rf_status_t rf_recv_bytes_raw(RsyncFetch_t *rf, char *dst, size_t len) {
 	size_t offset = in_stream->offset;
 	char *buf = in_stream->buf;
 
-	rf_unblock_threads(rf);
-
 	if(!buf) {
+		rf_unblock_threads(rf);
+
 		size = RF_STREAM_IN_BUFSIZE - RF_BUFSIZE_ADJUSTMENT;
 		buf = malloc(size);
 		if(!buf)
@@ -1024,6 +1027,8 @@ static rf_status_t rf_recv_bytes_raw(RsyncFetch_t *rf, char *dst, size_t len) {
 	}
 
 	if(len > fill) {
+		rf_unblock_threads(rf);
+
 		if(fill) {
 			if(offset + fill > size) {
 				size_t amount = size - offset;
