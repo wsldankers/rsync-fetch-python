@@ -1,5 +1,3 @@
-#define _LARGEFILE64_SOURCE 1
-#define _GNU_SOURCE 1
 #define PY_SSIZE_T_CLEAN
 
 #include "Python.h"
