@@ -4,7 +4,7 @@ from distutils.core import setup, Extension
 import re
 
 with open('debian/changelog') as changelog:
-	name, version = re.match('(\S+) \((\S+)\)', changelog.readline()).group(1, 2)
+	name, version = re.match(r'(\S+) \((\S+)\)', changelog.readline()).group(1, 2)
 
 setup(
 	name = name,
