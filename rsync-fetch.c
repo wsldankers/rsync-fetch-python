@@ -281,13 +281,13 @@ typedef struct rf_flist_entry {
 	rf_refstring_t symlink;
 	rf_refstring_t hardlink;
 	PyObject *data_callback;
-	int64_t size;
 	nanosecond_t mtime;
-	int32_t mode;
-	int32_t uid;
-	int32_t gid;
-	int32_t major;
-	int32_t minor;
+	uint64_t size;
+	uint32_t mode;
+	uint32_t uid;
+	uint32_t gid;
+	uint32_t major;
+	uint32_t minor;
 	bool is_hardlink_target;
 } rf_flist_entry_t;
 static const rf_flist_entry_t rf_flist_entry_0;
@@ -1438,6 +1438,10 @@ static rf_status_t rf_recv_varint(RsyncFetch_t *rf, int32_t *d) {
 	RF_RETURN_STATUS(RF_STATUS_OK);
 }
 
+static inline rf_status_t rf_recv_varint_unsigned(RsyncFetch_t *rf, uint32_t *d) {
+	return rf_recv_varint(rf, (int32_t *)d);
+}
+
 static rf_status_t rf_recv_varlong(RsyncFetch_t *rf, size_t min_bytes, int64_t *d) {
 	union {
 		char bytes[8];
@@ -1464,6 +1468,10 @@ static rf_status_t rf_recv_varlong(RsyncFetch_t *rf, size_t min_bytes, int64_t *
 	*d = le64(buf.int64);
 
 	RF_RETURN_STATUS(RF_STATUS_OK);
+}
+
+static inline rf_status_t rf_recv_varlong_unsigned(RsyncFetch_t *rf, size_t min_bytes, uint64_t *d) {
+	return rf_recv_varlong(rf, min_bytes, (int64_t *)d);
 }
 
 static rf_status_t rf_recv_ndx(RsyncFetch_t *rf, ndx_t *d) {
@@ -1862,7 +1870,7 @@ static rf_status_t rf_fill_flist_entry(RsyncFetch_t *rf, rf_flist_t *flist, rf_f
 		}
 	}
 
-	RF_PROPAGATE_ERROR(rf_recv_varlong(rf, 3, &entry->size));
+	RF_PROPAGATE_ERROR(rf_recv_varlong_unsigned(rf, 3, &entry->size));
 
 	if(xflags & XMIT_SAME_TIME) {
 		entry->mtime = rf->last.mtime;
@@ -1878,11 +1886,11 @@ static rf_status_t rf_fill_flist_entry(RsyncFetch_t *rf, rf_flist_t *flist, rf_f
 		entry->mtime += mtime_ns;
 	}
 
-	int32_t mode;
+	uint32_t mode;
 	if(xflags & XMIT_SAME_MODE) {
 		mode = entry->mode = rf->last.mode;
 	} else {
-		RF_PROPAGATE_ERROR(rf_recv_int32(rf, &mode));
+		RF_PROPAGATE_ERROR(rf_recv_uint32(rf, &mode));
 		rf->last.mode = entry->mode = mode;
 	}
 
@@ -1890,8 +1898,8 @@ static rf_status_t rf_fill_flist_entry(RsyncFetch_t *rf, rf_flist_t *flist, rf_f
 		entry->uid = rf->last.uid;
 		rf_refstring_dup(rf, rf->last.user, &entry->user);
 	} else {
-		int32_t uid;
-		RF_PROPAGATE_ERROR(rf_recv_varint(rf, &uid));
+		uint32_t uid;
+		RF_PROPAGATE_ERROR(rf_recv_varint_unsigned(rf, &uid));
 		rf->last.uid = entry->uid = uid;
 		if(xflags & XMIT_USER_NAME_FOLLOWS) {
 			uint8_t len;
@@ -1908,8 +1916,8 @@ static rf_status_t rf_fill_flist_entry(RsyncFetch_t *rf, rf_flist_t *flist, rf_f
 		entry->gid = rf->last.gid;
 		rf_refstring_dup(rf, rf->last.group, &entry->group);
 	} else {
-		int32_t gid;
-		RF_PROPAGATE_ERROR(rf_recv_varint(rf, &gid));
+		uint32_t gid;
+		RF_PROPAGATE_ERROR(rf_recv_varint_unsigned(rf, &gid));
 		rf->last.gid = entry->gid = gid;
 		if(xflags & XMIT_GROUP_NAME_FOLLOWS) {
 			uint8_t len;
@@ -1926,11 +1934,11 @@ static rf_status_t rf_fill_flist_entry(RsyncFetch_t *rf, rf_flist_t *flist, rf_f
 		if(xflags & XMIT_SAME_RDEV_MAJOR) {
 			entry->major = rf->last.major;
 		} else {
-			int32_t major;
-			RF_PROPAGATE_ERROR(rf_recv_varint(rf, &major));
+			uint32_t major;
+			RF_PROPAGATE_ERROR(rf_recv_varint_unsigned(rf, &major));
 			entry->major = rf->last.major = major;
 		}
-		RF_PROPAGATE_ERROR(rf_recv_varint(rf, &entry->minor));
+		RF_PROPAGATE_ERROR(rf_recv_varint_unsigned(rf, &entry->minor));
 	}
 
 	if(S_ISLNK(mode)) {
@@ -2021,17 +2029,17 @@ static rf_status_t rf_recv_flist(RsyncFetch_t *rf) {
 			rf_flist_entry_t *entry = entries[i];
 
 			rf_block_threads(rf);
-			PyObject *data_callback = PyObject_CallFunction(rf->entry_callback, "y#LLLLy#Ly#LLy#y#",
+			PyObject *data_callback = PyObject_CallFunction(rf->entry_callback, "y#KKKKy#Ky#KKy#y#",
 				entry->name, rf_refstring_len(entry->name),
-				(long long)entry->size,
-				(long long)entry->mtime,
-				(long long)entry->mode,
-				(long long)entry->uid,
+				(unsigned long long)entry->size,
+				(unsigned long long)entry->mtime,
+				(unsigned long long)entry->mode,
+				(unsigned long long)entry->uid,
 				entry->user, rf_refstring_len(entry->user),
-				(long long)entry->gid,
+				(unsigned long long)entry->gid,
 				entry->group, rf_refstring_len(entry->group),
-				(long long)entry->major,
-				(long long)entry->minor,
+				(unsigned long long)entry->major,
+				(unsigned long long)entry->minor,
 				entry->symlink, rf_refstring_len(entry->symlink),
 				entry->hardlink, rf_refstring_len(entry->hardlink)
 			);
