@@ -1890,7 +1890,9 @@ static rf_status_t rf_fill_flist_entry(RsyncFetch_t *rf, rf_flist_t *flist, rf_f
 		entry->uid = rf->last.uid;
 		rf_refstring_dup(rf, rf->last.user, &entry->user);
 	} else {
-		RF_PROPAGATE_ERROR(rf_recv_varint(rf, &entry->uid));
+		int32_t uid;
+		RF_PROPAGATE_ERROR(rf_recv_varint(rf, &uid));
+		rf->last.uid = entry->uid = uid;
 		if(xflags & XMIT_USER_NAME_FOLLOWS) {
 			uint8_t len;
 			RF_PROPAGATE_ERROR(rf_recv_uint8(rf, &len));
@@ -1906,7 +1908,9 @@ static rf_status_t rf_fill_flist_entry(RsyncFetch_t *rf, rf_flist_t *flist, rf_f
 		entry->gid = rf->last.gid;
 		rf_refstring_dup(rf, rf->last.group, &entry->group);
 	} else {
-		RF_PROPAGATE_ERROR(rf_recv_varint(rf, &entry->gid));
+		int32_t gid;
+		RF_PROPAGATE_ERROR(rf_recv_varint(rf, &gid));
+		rf->last.gid = entry->gid = gid;
 		if(xflags & XMIT_GROUP_NAME_FOLLOWS) {
 			uint8_t len;
 			RF_PROPAGATE_ERROR(rf_recv_uint8(rf, &len));
@@ -1919,10 +1923,10 @@ static rf_status_t rf_fill_flist_entry(RsyncFetch_t *rf, rf_flist_t *flist, rf_f
 	}
 
 	if(S_ISCHR(mode) || S_ISBLK(mode) || ((S_ISFIFO(mode) || S_ISSOCK(mode)) && rf->protocol < 31)) {
-		int32_t major;
 		if(xflags & XMIT_SAME_RDEV_MAJOR) {
-			major = entry->major = rf->last.major;
+			entry->major = rf->last.major;
 		} else {
+			int32_t major;
 			RF_PROPAGATE_ERROR(rf_recv_varint(rf, &major));
 			entry->major = rf->last.major = major;
 		}
